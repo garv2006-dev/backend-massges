@@ -76,6 +76,8 @@ class CampaignContactInDB(BaseModel):
     completed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
 
     class Config:
         from_attributes = True

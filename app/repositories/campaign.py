@@ -73,10 +73,13 @@ class CampaignRepository:
             .where(CampaignContact.campaign_id == campaign_id)
             .group_by(CampaignContact.status)
         )
-        status_counts = {row[0]: row[1] for row in result.all()}
+        status_counts = {}
+        for row in result.all():
+            st = row[0].value if hasattr(row[0], 'value') else str(row[0]).lower()
+            status_counts[st] = row[1]
         
         db_campaign.total_contacts = sum(status_counts.values())
-        db_campaign.queued_calls = status_counts.get("queued", 0)
+        db_campaign.queued_calls = status_counts.get("queued", 0) + status_counts.get("pending", 0)
         db_campaign.in_progress_calls = status_counts.get("in_progress", 0)
         db_campaign.completed_calls = status_counts.get("completed", 0)
         db_campaign.failed_calls = status_counts.get("failed", 0)
@@ -129,11 +132,17 @@ class CampaignContactRepository:
         return db_cc
 
     async def list(self, campaign_id: uuid.UUID, skip: int = 0, limit: int = 100, status: Optional[str] = None) -> List[CampaignContact]:
-        query = select(CampaignContact).where(CampaignContact.campaign_id == campaign_id)
+        from sqlalchemy.orm import selectinload
+        query = select(CampaignContact).options(selectinload(CampaignContact.contact)).where(CampaignContact.campaign_id == campaign_id)
         if status:
             query = query.where(CampaignContact.status == status)
         result = await self.db.execute(query.offset(skip).limit(limit))
-        return result.scalars().all()
+        items = result.scalars().all()
+        for item in items:
+            if hasattr(item, 'contact') and item.contact:
+                item.contact_name = item.contact.name
+                item.contact_phone = item.contact.phone_number_normalized or item.contact.phone_number
+        return items
 
     async def get_next_pending(self, campaign_id: uuid.UUID, limit: int = 5) -> List[CampaignContact]:
         result = await self.db.execute(

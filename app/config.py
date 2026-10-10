@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     TWILIO_ACCOUNT_SID: Optional[str] = None
     TWILIO_AUTH_TOKEN: Optional[str] = None
     TWILIO_PHONE_NUMBER: Optional[str] = None
+    TWILIO_API_KEY: Optional[str] = None
+    TWILIO_API_SECRET: Optional[str] = None
+    PUBLIC_WEBHOOK_URL: Optional[str] = None  # e.g., "https://abc123.ngrok-free.app"
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -36,8 +39,14 @@ class Settings(BaseSettings):
     MAX_CALL_DURATION: int = 300
     MAX_RETRIES: int = 3
     CAMPAIGN_CONCURRENCY_LIMIT: int = 5
+    DEFAULT_PHONE_REGION: str = "IN"
+
+    # Clerk (Optional)
+    CLERK_SECRET_KEY: Optional[str] = None
+    CLERK_PUBLISHABLE_KEY: Optional[str] = None
     
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 settings = Settings()

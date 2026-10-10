@@ -32,11 +32,14 @@ class ExcelService:
         Returns:
             Tuple of (import_id, import_result)
         """
-        # Read Excel file
+        # Read Excel or CSV file
         try:
-            df = pd.read_excel(io.BytesIO(file_content))
+            if file_name.lower().endswith('.csv'):
+                df = pd.read_csv(io.BytesIO(file_content))
+            else:
+                df = pd.read_excel(io.BytesIO(file_content))
         except Exception as e:
-            raise ValueError(f"Failed to read Excel file: {str(e)}")
+            raise ValueError(f"Failed to read file: {str(e)}")
         
         # Validate file
         if df.empty:
@@ -64,13 +67,28 @@ class ExcelService:
         errors = []
         
         required_fields = ["phone"]
-        phone_column = column_mapping.get("phone", "phone")
+        # Case-insensitive column lookup helper
+        col_lookup = {str(c).strip().lower(): str(c) for c in df.columns}
+        phone_col = column_mapping.get("phone") or col_lookup.get("phone") or col_lookup.get("phone_number") or col_lookup.get("mobile") or col_lookup.get("contact") or "phone"
+        name_col = column_mapping.get("name") or col_lookup.get("name") or col_lookup.get("full_name") or col_lookup.get("first_name")
+        email_col = column_mapping.get("email") or col_lookup.get("email") or col_lookup.get("email_address")
+        lang_col = column_mapping.get("language") or col_lookup.get("language") or col_lookup.get("lang")
+        standard_cols = {c for c in [phone_col, name_col, email_col, lang_col] if c is not None}
         
         for idx, row in df.iterrows():
             try:
-                # Extract phone number
-                phone_raw = str(row.get(phone_column, "")).strip()
-                if not phone_raw or phone_raw == "nan":
+                # Extract phone number safely
+                raw_val = row.get(phone_col)
+                if pd.isna(raw_val) or raw_val is None:
+                    phone_raw = ""
+                elif isinstance(raw_val, float) and raw_val.is_integer():
+                    phone_raw = str(int(raw_val))
+                else:
+                    phone_raw = str(raw_val).strip()
+                    if phone_raw.endswith(".0"):
+                        phone_raw = phone_raw[:-2]
+
+                if not phone_raw or phone_raw.lower() in ["nan", "none"]:
                     errors.append(f"Row {idx + 2}: Missing phone number")
                     failure_count += 1
                     continue
@@ -88,16 +106,30 @@ class ExcelService:
                     duplicate_count += 1
                     continue
                 
-                # Extract other fields
-                name = str(row.get(column_mapping.get("name", "name"), "")).strip() if column_mapping.get("name") else None
-                email = str(row.get(column_mapping.get("email", "email"), "")).strip() if column_mapping.get("email") else None
-                language = str(row.get(column_mapping.get("language", "language"), "en")).strip() if column_mapping.get("language") else "en"
+                # Extract other standard fields
+                name = None
+                if name_col and not pd.isna(row.get(name_col)):
+                    name_val = str(row.get(name_col)).strip()
+                    if name_val.lower() not in ["nan", "none", ""]:
+                        name = name_val
                 
-                # Clean up NaN values
-                if name == "nan":
-                    name = None
-                if email == "nan":
-                    email = None
+                email = None
+                if email_col and not pd.isna(row.get(email_col)):
+                    email_val = str(row.get(email_col)).strip()
+                    if email_val.lower() not in ["nan", "none", ""]:
+                        email = email_val
+
+                language = "en"
+                if lang_col and not pd.isna(row.get(lang_col)):
+                    lang_val = str(row.get(lang_col)).strip()
+                    if lang_val.lower() not in ["nan", "none", ""]:
+                        language = lang_val
+
+                # Capture any additional unmapped columns as custom_fields
+                custom_fields = {}
+                for col in df.columns:
+                    if col not in standard_cols and not pd.isna(row.get(col)):
+                        custom_fields[str(col)] = row.get(col)
                 
                 # Create contact
                 from app.schemas.contact import ContactCreate
@@ -106,7 +138,8 @@ class ExcelService:
                         phone_number=phone_raw,
                         name=name,
                         email=email,
-                        language=language
+                        language=language,
+                        custom_fields=custom_fields if custom_fields else None
                     ),
                     phone_normalized=phone_normalized,
                     import_id=contact_import.id
@@ -131,7 +164,7 @@ class ExcelService:
         )
         
         result = {
-            "import_id": contact_import.id,
+            "import_id": str(contact_import.id),
             "total_rows": row_count,
             "success_count": success_count,
             "failure_count": failure_count,

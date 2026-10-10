@@ -10,6 +10,9 @@ from app.models.extracted_call_result import ExtractedCallResult
 from app.models.provider_configuration import ProviderConfiguration
 from app.models.usage_record import UsageRecord
 from app.models.audit_log import AuditLog
+from app.models.consent_record import ContactConsent, SuppressionRecord
+from app.models.tool_execution_audit import ToolExecutionAuditLog
+from app.models.call_follow_up import CallFollowUp
 
 __all__ = [
     "User",
@@ -24,4 +27,8 @@ __all__ = [
     "ProviderConfiguration",
     "UsageRecord",
     "AuditLog",
+    "ContactConsent",
+    "SuppressionRecord",
+    "ToolExecutionAuditLog",
+    "CallFollowUp",
 ]
