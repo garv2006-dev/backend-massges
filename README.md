@@ -1,6 +1,6 @@
 # AI Voice Calling Platform - Backend
 
-FastAPI backend for AI-powered voice calling with PostgreSQL, telephony integration, and AI services.
+FastAPI backend for AI-powered voice calling with PostgreSQL, telephony integration, and LangGraph agent orchestration.
 
 ## Project Structure
 
@@ -8,41 +8,114 @@ FastAPI backend for AI-powered voice calling with PostgreSQL, telephony integrat
 backend/
 ├── app/
 │   ├── __init__.py
-│   ├── config.py           # Application configuration using pydantic-settings
-│   ├── database.py         # Async database connection and session management
-│   ├── models/             # SQLAlchemy ORM models
+│   ├── config.py                    # Application configuration using pydantic-settings
+│   ├── database.py                  # Async database connection and session management
+│   ├── models/                      # SQLAlchemy ORM models
 │   │   ├── __init__.py
-│   │   └── user.py
-│   ├── routers/            # API route handlers
+│   │   ├── user.py
+│   │   ├── campaign.py
+│   │   ├── contact.py
+│   │   ├── call.py
+│   │   ├── transcript.py
+│   │   ├── consent_record.py
+│   │   ├── suppression_record.py
+│   │   ├── tool_execution_audit.py
+│   │   └── call_follow_up.py
+│   ├── routers/                     # API route handlers
 │   │   ├── __init__.py
 │   │   └── main.py
-│   ├── schemas/            # Pydantic schemas for request/response validation
+│   ├── schemas/                     # Pydantic schemas for request/response validation
+│   │   ├── __init__.py
+│   │   ├── user.py
+│   │   ├── campaign.py
+│   │   ├── contact.py
+│   │   └── call.py
+│   ├── services/                    # Business logic layer
+│   │   ├── __init__.py
+│   │   ├── ai_voice_engine.py       # Legacy AI voice engine (for demo/chat)
+│   │   ├── campaign_runner.py       # Campaign execution service
+│   │   └── excel_service.py         # Excel import/export
+│   ├── agent/                       # LangGraph Agent Orchestration
+│   │   ├── __init__.py
+│   │   ├── state.py                 # Typed conversation state
+│   │   ├── gemini.py                # Gemini model integration
+│   │   ├── audio_pipeline.py        # Audio transport layer
+│   │   ├── service.py               # High-level orchestration
+│   │   ├── graph/                   # LangGraph graph definition
+│   │   │   ├── __init__.py
+│   │   │   ├── builder.py           # Graph construction
+│   │   │   ├── nodes.py             # Graph node implementations
+│   │   │   ├── edges.py             # Conditional routing edges
+│   │   │   └── checkpointer.py      # Checkpointer configuration
+│   │   └── tools/                   # LangGraph tools
+│   │       ├── __init__.py
+│   │       ├── definitions.py       # Tool implementations
+│   │       ├── schemas.py           # Tool validation schemas
+│   │       └── security.py          # Tool security layer
+│   ├── api/                         # API endpoint organization
+│   │   ├── __init__.py
+│   │   ├── auth.py                  # Authentication endpoints
+│   │   ├── campaigns.py             # Campaign management
+│   │   ├── contacts.py              # Contact management
+│   │   ├── dashboard.py             # Dashboard analytics
+│   │   ├── agent.py                 # LangGraph agent endpoints
+│   │   └── telephony.py             # Telephony webhooks
+│   ├── core/                        # Core utilities and constants
+│   │   ├── __init__.py
+│   │   └── deps.py                  # Dependency injection
+│   ├── repositories/                # Data access layer
+│   │   ├── __init__.py
+│   │   ├── user.py
+│   │   ├── campaign.py
+│   │   └── contact.py
+│   ├── integrations/                # Third-party integrations
+│   │   ├── __init__.py
+│   │   ├── telephony/               # Telephony provider adapters
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   └── twilio.py
+│   │   ├── speech_to_text/          # STT providers (Deepgram)
+│   │   │   └── __init__.py
+│   │   ├── llm/                     # LLM providers (Gemini)
+│   │   │   └── __init__.py
+│   │   └── text_to_speech/          # TTS providers (Edge-TTS)
+│   │       └── __init__.py
+│   ├── middleware/                  # Custom middleware
 │   │   └── __init__.py
-│   ├── services/           # Business logic layer
+│   ├── workers/                     # Background job workers
 │   │   └── __init__.py
-│   ├── middleware/         # Custom middleware
-│   │   └── __init__.py
-│   ├── api/                # API endpoint organization
-│   ├── core/               # Core utilities and constants
-│   ├── repositories/       # Data access layer
-│   ├── integrations/       # Third-party integrations
-│   │   ├── telephony/      # Telephony provider adapters (Twilio, etc.)
-│   │   ├── speech_to_text/ # STT providers (Deepgram)
-│   │   ├── llm/            # LLM providers (Gemini)
-│   │   └── text_to_speech/ # TTS providers (Edge-TTS, production TTS)
-│   ├── workers/            # Background job workers
-│   ├── security/           # Security utilities (JWT, password hashing)
-│   └── utils/              # Utility functions (phone normalization, etc.)
-├── alembic/                # Database migrations
+│   ├── security/                    # Security utilities
+│   │   ├── __init__.py
+│   │   ├── jwt.py
+│   │   └── password.py
+│   └── utils/                       # Utility functions
+│       ├── __init__.py
+│       └── phone.py
+├── alembic/                         # Database migrations
 │   ├── versions/
+│   │   ├── 001_initial_schema.py
+│   │   └── 002_langgraph_orchestration.py
 │   └── env.py
-├── tests/                  # Test suite
-├── main.py                 # Application entry point
-├── requirements.txt        # Python dependencies
-├── .env.example            # Example environment variables
-├── .gitignore              # Git ignore rules
-├── alembic.ini             # Alembic configuration
-└── README.md               # This file
+├── tests/                           # Test suite
+│   ├── __init__.py
+│   ├── conftest.py                  # Test configuration
+│   ├── test_graph_edges.py          # Graph routing tests
+│   ├── test_tools.py                # Tool execution tests
+│   ├── test_tool_security.py        # Security tests
+│   └── test_agent_integration.py    # Integration tests
+├── docs/                            # Documentation
+│   ├── README.md                    # Documentation index
+│   ├── LANGGRAPH_ARCHITECTURE.md    # Architecture documentation
+│   ├── ENVIRONMENT_SETUP.md         # Environment configuration
+│   ├── RUNNING_AND_DEBUGGING.md     # Running and debugging guide
+│   ├── DEPENDENCY_VERIFICATION.md   # Dependency compatibility
+│   └── LANGGRAPH_DELIVERABLES_SUMMARY.md
+├── main.py                          # Application entry point
+├── requirements.txt                 # Python dependencies
+├── .env.example                     # Example environment variables
+├── .gitignore                       # Git ignore rules
+├── alembic.ini                      # Alembic configuration
+└── README.md                        # This file
 ```
 
 ## Setup
@@ -121,18 +194,63 @@ alembic downgrade -1
 
 ## Key Features
 
+### Core Platform
 - Async SQLAlchemy with PostgreSQL
 - JWT authentication with bcrypt password hashing
 - Alembic database migrations
 - Phone number normalization with phonenumbers library
 - Excel import/export with pandas and openpyxl
-- Telephony provider adapters (Twilio)
-- Speech-to-text integration (Deepgram)
-- LLM integration (Google Gemini)
-- Text-to-speech integration (Edge-TTS, production providers)
 - Background job processing with Celery/ARQ
 - Real-time updates with WebSockets
 - Role-based access control
 - Audit logging
 - Rate limiting
 - Webhook signature validation
+
+### LangGraph Agent Orchestration
+- **LangGraph StateGraph** for conversation orchestration
+- **Conditional routing** for dynamic conversation flows
+- **Tool calling** with 8 security-hardened tools
+- **State management** with TypedDict and checkpointing
+- **Gemini integration** for AI responses
+- **Audio pipeline** with barge-in support
+- **Consent enforcement** and opt-out detection
+- **Tool audit logging** for compliance
+- **Multi-step workflows** with bounded iterations
+- **Error recovery** with retry logic
+
+### Integrations
+- Telephony provider adapters (Twilio)
+- Speech-to-text integration (Deepgram)
+- LLM integration (Google Gemini)
+- Text-to-speech integration (Edge-TTS, production providers)
+
+## Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
+
+- **[docs/LANGGRAPH_ARCHITECTURE.md](docs/LANGGRAPH_ARCHITECTURE.md)** - Complete LangGraph architecture, graph structure, and workflow documentation
+- **[docs/ENVIRONMENT_SETUP.md](docs/ENVIRONMENT_SETUP.md)** - Environment variable configuration and setup guide
+- **[docs/RUNNING_AND_DEBUGGING.md](docs/RUNNING_AND_DEBUGGING.md)** - Running the server, debugging graph execution, and troubleshooting
+- **[docs/DEPENDENCY_VERIFICATION.md](docs/DEPENDENCY_VERIFICATION.md)** - Dependency compatibility and version verification
+- **[docs/LANGGRAPH_DELIVERABLES_SUMMARY.md](docs/LANGGRAPH_DELIVERABLES_SUMMARY.md)** - Summary of LangGraph integration deliverables
+
+## Testing
+
+Run the test suite:
+
+```bash
+# Run all tests
+pytest tests/ -v
+
+# Run specific test file
+pytest tests/test_graph_edges.py -v
+
+# Run with coverage
+pytest tests/ --cov=app --cov-report=html
+```
+
+Test coverage includes:
+- 67 unit tests for graph routing, tools, and security
+- 10 integration tests for complete workflows
+- Mock models for deterministic testing

@@ -72,3 +72,8 @@ celerybeat.pid
 .DS_Store
 Thumbs.db
 
+# LangGraph and Agent State
+.agent_state/
+checkpoints/
+*.checkpoint
+
