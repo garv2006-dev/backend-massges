@@ -149,6 +149,8 @@ async def start_whatsapp_session():
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             res = await client.post(url, headers=headers)
+            # Ensure webhook is actively registered for inbound message auto-reply
+            await openwa_provider.ensure_webhook_registered()
             if res.status_code in [200, 201]:
                 return {"success": True, "data": res.json()}
             return {"success": False, "statusCode": res.status_code, "detail": res.text}

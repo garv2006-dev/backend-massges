@@ -127,6 +127,39 @@ class OpenWATelephonyProvider(TelephonyProvider):
             logger.error(f"Error creating OpenWA session: {e}")
             return {"success": False, "error": str(e)}
 
+    async def ensure_webhook_registered(self) -> Dict[str, Any]:
+        """Ensure the backend webhook is actively registered on OpenWA for real-time customer replies."""
+        webhook_target = getattr(settings, "PUBLIC_WEBHOOK_URL", None)
+        if not webhook_target or any(s in webhook_target for s in ["trycloudflare", "ngrok", "your-"]):
+            webhook_target = "http://host.docker.internal:8000"
+        
+        target_url = f"{webhook_target.rstrip('/')}/api/telephony/openwa/webhook"
+        list_url = f"{self.base_url}/api/sessions/{self.session_id}/webhooks"
+        headers = self.get_auth_headers()
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(list_url, headers=headers)
+                if res.status_code == 200:
+                    existing = res.json()
+                    if isinstance(existing, list):
+                        for hook in existing:
+                            if hook.get("url") == target_url and hook.get("active", True):
+                                return {"success": True, "already_registered": True, "webhook": hook}
+                # Register webhook
+                create_payload = {
+                    "url": target_url,
+                    "events": ["*"]
+                }
+                c_res = await client.post(list_url, json=create_payload, headers=headers)
+                if c_res.status_code in [200, 201]:
+                    logger.info(f"Successfully registered OpenWA webhook to {target_url}")
+                    return {"success": True, "registered": True, "webhook": c_res.json()}
+                logger.warning(f"Could not register OpenWA webhook: {c_res.status_code} - {c_res.text}")
+                return {"success": False, "detail": c_res.text}
+        except Exception as e:
+            logger.warning(f"Notice on ensuring OpenWA webhook: {e}")
+            return {"success": False, "error": str(e)}
+
     async def synthesize_speech_bytes(
         self,
         text: str,

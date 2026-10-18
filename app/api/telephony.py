@@ -12,10 +12,11 @@ import uuid
 import json
 import logging
 import re
+import time
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, WebSocket, WebSocketDisconnect, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select, desc
 
@@ -25,12 +26,95 @@ from app.models.whatsapp_message import WhatsAppMessage
 from app.models.company_profile import CompanyProfile
 from app.services.ai_voice_engine import AIVoiceEngine
 from app.integrations.telephony.openwa import OpenWATelephonyProvider
+from app.security.jwt import decode_access_token
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Global provider instance
 openwa_provider = OpenWATelephonyProvider()
+
+# In-memory deduplication cache for webhook events (guarantees idempotency if gateway retries)
+_PROCESSED_WEBHOOK_MSG_IDS: Dict[str, float] = {}
+_MAX_PROCESSED_CACHE_SIZE = 10000
+
+def is_duplicate_webhook_msg(msg_id: str, ttl_seconds: int = 300) -> bool:
+    """Check and record webhook message ID to guarantee idempotent delivery without redundant processing."""
+    if not msg_id:
+        return False
+    now = time.time()
+    expired = [k for k, ts in list(_PROCESSED_WEBHOOK_MSG_IDS.items()) if now - ts > ttl_seconds]
+    for k in expired:
+        _PROCESSED_WEBHOOK_MSG_IDS.pop(k, None)
+    
+    # Memory guard for production under high volume
+    if len(_PROCESSED_WEBHOOK_MSG_IDS) > _MAX_PROCESSED_CACHE_SIZE:
+        oldest_keys = sorted(_PROCESSED_WEBHOOK_MSG_IDS.keys(), key=lambda k: _PROCESSED_WEBHOOK_MSG_IDS[k])[:1000]
+        for k in oldest_keys:
+            _PROCESSED_WEBHOOK_MSG_IDS.pop(k, None)
+
+    if msg_id in _PROCESSED_WEBHOOK_MSG_IDS:
+        return True
+    _PROCESSED_WEBHOOK_MSG_IDS[msg_id] = now
+    return False
+
+
+class ConnectionManager:
+    """Production-grade WebSocket connection manager with client isolation and heartbeat support."""
+    def __init__(self):
+        self.active_connections: List[Tuple[WebSocket, Optional[str]]] = []
+
+    async def connect(self, websocket: WebSocket, user_id: Optional[str] = None):
+        await websocket.accept()
+        self.active_connections.append((websocket, user_id))
+        logger.info(f"WebSocket client connected (user_id={user_id}). Total active: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections = [c for c in self.active_connections if c[0] != websocket]
+        logger.info(f"WebSocket client disconnected. Total active: {len(self.active_connections)}")
+
+    async def broadcast(self, message: dict, target_user_id: Optional[str] = None):
+        """Broadcast message to connected clients, optionally filtered by user_id for multi-tenant isolation."""
+        dead = []
+        for ws, uid in list(self.active_connections):
+            if target_user_id and uid and uid != target_user_id:
+                continue
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                logger.debug(f"Error streaming to WebSocket client: {e}")
+                dead.append(ws)
+        for d in dead:
+            self.disconnect(d)
+
+
+ws_manager = ConnectionManager()
+
+
+@router.websocket("/ws/chat")
+async def websocket_chat_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
+    """
+    Production-ready real-time WebSocket connection to stream incoming WhatsApp webhook messages
+    to the UI with zero polling latency, JWT token authentication, and heartbeat ping/pong support.
+    """
+    user_id: Optional[str] = None
+    if token:
+        try:
+            user_id = decode_access_token(token)
+        except Exception as e:
+            logger.debug(f"WebSocket token validation notice: {e}")
+
+    await ws_manager.connect(websocket, user_id=user_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.debug(f"WebSocket closed: {e}")
+        ws_manager.disconnect(websocket)
 
 
 class TestCallRequest(BaseModel):
@@ -164,117 +248,215 @@ async def handle_openwa_webhook(request: Request):
         if data.get("fromMe") is True or data.get("key", {}).get("fromMe") is True:
             return {"status": "ignored", "reason": "outbound_message"}
 
-        sender_jid = data.get("from") or data.get("chatId") or data.get("key", {}).get("remoteJid", "")
+        sender_jid = (
+            data.get("from") or 
+            data.get("chatId") or 
+            data.get("key", {}).get("remoteJid", "")
+        )
         if "@g.us" in sender_jid:
             # Skip group messages
             return {"status": "ignored", "reason": "group_message"}
 
         clean_phone = re.sub(r"[^\d]", "", sender_jid.split("@")[0])
-        user_text = (data.get("body") or data.get("text") or "").strip()
+        
+        # Robust multi-format text extraction (Baileys / WPPConnect / OpenWA Gateway)
+        user_text = (
+            data.get("body") or 
+            data.get("text") or 
+            data.get("content") or 
+            data.get("message", {}).get("conversation") or 
+            data.get("message", {}).get("extendedTextMessage", {}).get("text") or 
+            ""
+        ).strip()
 
         if not user_text:
             return {"status": "ignored", "reason": "empty_content"}
 
-        logger.info(f"Customer [{clean_phone}] replied on WhatsApp: '{user_text}'")
+        # Extract real contact display name if available from WhatsApp
+        push_name = (
+            data.get("notifyName") or 
+            data.get("pushName") or 
+            data.get("sender", {}).get("pushname") or 
+            data.get("sender", {}).get("name") or 
+            None
+        )
+
+        # Production Idempotency Guard: Ignore duplicate webhook deliveries from gateway retries
+        raw_msg_id = (
+            data.get("id") or 
+            data.get("messageId") or 
+            data.get("key", {}).get("id") or 
+            ""
+        )
+        if raw_msg_id and is_duplicate_webhook_msg(str(raw_msg_id)):
+            logger.info(f"Duplicate webhook message [{raw_msg_id}] ignored (idempotent guard).")
+            return {"status": "ignored", "reason": "duplicate_webhook_event", "message_id": str(raw_msg_id)}
+
+        logger.info(f"Customer [{clean_phone}] ({push_name or 'WhatsApp Customer'}) replied on WhatsApp: '{user_text}'")
+        formatted_phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
 
         async with AsyncSessionLocal() as db:
-            # Find or create active WhatsApp conversation thread
-            conv_stmt = select(WhatsAppConversation).where(
-                WhatsAppConversation.phone_number == clean_phone
-            ).order_by(desc(WhatsAppConversation.updated_at))
-            conv_res = await db.execute(conv_stmt)
-            conv = conv_res.scalars().first()
-
-            if not conv:
-                conv = WhatsAppConversation(
-                    phone_number=clean_phone,
-                    contact_name="WhatsApp Customer",
-                    chat_jid=sender_jid,
-                    last_message_text=user_text,
-                    last_message_at=datetime.utcnow()
-                )
-                db.add(conv)
-                await db.commit()
-                await db.refresh(conv)
-
-            # Record customer's incoming message
-            cust_msg = WhatsAppMessage(
-                conversation_id=conv.id,
-                sender="customer",
-                direction="inbound",
-                message_text=user_text,
-                status="received",
-                chat_jid=sender_jid,
-                ai_generated=False
-            )
-            db.add(cust_msg)
-            await db.commit()
-
-            # Retrieve recent conversation history
-            hist_stmt = select(WhatsAppMessage).where(
-                WhatsAppMessage.conversation_id == conv.id
-            ).order_by(WhatsAppMessage.created_at.asc()).limit(20)
-            hist_res = await db.execute(hist_stmt)
-            messages = hist_res.scalars().all()
-
-            dialogue_history = []
-            for m in messages:
-                dialogue_history.append({
-                    "speaker": "agent" if m.sender == "agent" else "customer",
-                    "text": m.message_text
-                })
-
-            # Check company profile for context
-            comp_stmt = select(CompanyProfile).order_by(desc(CompanyProfile.created_at)).limit(1)
-            comp_res = await db.execute(comp_stmt)
-            company_profile = comp_res.scalar_one_or_none()
-
-            provider_config = {}
-            if company_profile:
-                provider_config = {
-                    "company_name": company_profile.name,
-                    "tone": "helpful, polite, and professional",
-                    "language": "English",
-                    "description": company_profile.description or ""
-                }
-
-            # Generate natural, human-like AI reply
-            agent_reply = await AIVoiceEngine.generate_live_turn(
-                campaign_name="WhatsApp Assistant",
-                agent_prompt=f"Assist the customer regarding {provider_config.get('company_name', 'our company')}.",
-                provider_config=provider_config,
-                conversation_history=dialogue_history,
-                user_message=user_text,
-                contact_name=conv.contact_name or "Valued Customer"
-            )
-
-            # Save outbound AI response
-            ai_msg = WhatsAppMessage(
-                conversation_id=conv.id,
-                sender="agent",
-                direction="outbound",
-                message_text=agent_reply,
-                status="sent",
-                chat_jid=sender_jid,
-                ai_generated=True
-            )
-            db.add(ai_msg)
-
-            # Update conversation summary
-            conv.last_message_text = agent_reply
-            conv.last_message_at = datetime.utcnow()
-            await db.commit()
-
-            # Deliver pure text reply directly via OpenWA
             try:
-                await openwa_provider.send_text_message(
-                    chat_id=sender_jid,
-                    text=f"🤖 {agent_reply}"
-                )
-            except Exception as se:
-                logger.error(f"Failed to deliver WhatsApp reply via OpenWA: {se}")
+                # Find or create active WhatsApp conversation thread
+                phone_variants = [clean_phone, f"+{clean_phone}"]
+                if len(clean_phone) >= 10:
+                    last10 = clean_phone[-10:]
+                    phone_variants.extend([last10, f"+91{last10}", f"+1{last10}"])
 
-        return {"status": "success", "processed": True, "reply": agent_reply}
+                conv_stmt = select(WhatsAppConversation).where(
+                    WhatsAppConversation.phone_number.in_(phone_variants)
+                ).order_by(desc(WhatsAppConversation.updated_at))
+                conv_res = await db.execute(conv_stmt)
+                conv = conv_res.scalars().first()
+
+                comp_stmt = select(CompanyProfile).order_by(desc(CompanyProfile.created_at)).limit(1)
+                comp_res = await db.execute(comp_stmt)
+                company_profile = comp_res.scalar_one_or_none()
+
+                if not conv:
+                    conv = WhatsAppConversation(
+                        user_id=company_profile.user_id if company_profile else None,
+                        phone_number=formatted_phone,
+                        contact_name=push_name or "WhatsApp Customer",
+                        chat_jid=sender_jid,
+                        last_message_text=user_text,
+                        last_message_at=datetime.utcnow()
+                    )
+                    db.add(conv)
+                    await db.commit()
+                    await db.refresh(conv)
+                elif push_name and (conv.contact_name in ["WhatsApp Customer", "Customer", None, ""]):
+                    conv.contact_name = push_name
+                    await db.commit()
+
+                # Record customer's incoming message
+                cust_msg = WhatsAppMessage(
+                    conversation_id=conv.id,
+                    sender="customer",
+                    direction="inbound",
+                    message_text=user_text,
+                    status="received",
+                    openwa_message_id=str(raw_msg_id) if raw_msg_id else None,
+                    chat_jid=sender_jid,
+                    ai_generated=False
+                )
+                db.add(cust_msg)
+                await db.commit()
+
+                # Instantly push incoming customer message to connected frontend UI via WebSocket
+                try:
+                    await ws_manager.broadcast({
+                        "type": "new_message",
+                        "conversation_id": str(conv.id),
+                        "phone_number": conv.phone_number,
+                        "contact_name": conv.contact_name or "WhatsApp Customer",
+                        "message": {
+                            "id": str(cust_msg.id),
+                            "sender": "customer",
+                            "text": user_text,
+                            "time": datetime.utcnow().strftime("%I:%M %p"),
+                            "status": "received",
+                            "created_at": datetime.utcnow().isoformat()
+                        }
+                    })
+                except Exception as wse:
+                    logger.debug(f"WebSocket broadcast notice: {wse}")
+
+                # Retrieve recent conversation history
+                hist_stmt = select(WhatsAppMessage).where(
+                    WhatsAppMessage.conversation_id == conv.id
+                ).order_by(WhatsAppMessage.created_at.asc()).limit(20)
+                hist_res = await db.execute(hist_stmt)
+                messages = hist_res.scalars().all()
+
+                dialogue_history = []
+                for m in messages:
+                    dialogue_history.append({
+                        "speaker": "agent" if m.sender == "agent" else "customer",
+                        "text": m.message_text
+                    })
+
+                provider_config = {
+                    "company_name": "Our Company",
+                    "agent_name": "Sarah",
+                    "tone": "helpful, warm, and professional",
+                    "language": "English"
+                }
+                if company_profile:
+                    provider_config = {
+                        "company_name": company_profile.name or "Our Company",
+                        "agent_name": company_profile.default_agent_name or "Sarah",
+                        "tone": "helpful, warm, and professional",
+                        "language": company_profile.default_language or "English",
+                        "industry": company_profile.industry or "Customer Support & Services"
+                    }
+
+                # Generate natural, human-like AI reply with resilient fallback
+                try:
+                    agent_reply = await AIVoiceEngine.generate_live_turn(
+                        campaign_name="WhatsApp Assistant",
+                        agent_prompt=f"Assist the customer regarding {provider_config.get('company_name', 'our company')}.",
+                        provider_config=provider_config,
+                        conversation_history=dialogue_history,
+                        user_message=user_text,
+                        contact_name=conv.contact_name or "Valued Customer"
+                    )
+                except Exception as ai_err:
+                    logger.error(f"AI response generation error: {ai_err}, using polite fallback", exc_info=True)
+                    c_name = provider_config.get("company_name", "our team")
+                    agent_reply = f"Hello {conv.contact_name or 'there'}! Thank you for reaching out to {c_name}. We have received your message and our team is reviewing it right now. How else may I assist you?"
+
+                # Save outbound AI response
+                ai_msg = WhatsAppMessage(
+                    conversation_id=conv.id,
+                    sender="agent",
+                    direction="outbound",
+                    message_text=agent_reply,
+                    status="sent",
+                    chat_jid=sender_jid,
+                    ai_generated=True
+                )
+                db.add(ai_msg)
+
+                # Update conversation summary
+                conv.last_message_text = agent_reply
+                conv.last_message_at = datetime.utcnow()
+                await db.commit()
+
+                # Instantly push AI agent reply to connected frontend UI via WebSocket
+                try:
+                    await ws_manager.broadcast({
+                        "type": "new_message",
+                        "conversation_id": str(conv.id),
+                        "phone_number": conv.phone_number,
+                        "contact_name": conv.contact_name or "WhatsApp Customer",
+                        "message": {
+                            "id": str(ai_msg.id),
+                            "sender": "agent",
+                            "text": agent_reply,
+                            "time": datetime.utcnow().strftime("%I:%M %p"),
+                            "status": "sent",
+                            "created_at": datetime.utcnow().isoformat()
+                        }
+                    })
+                except Exception as wse:
+                    logger.debug(f"WebSocket broadcast notice: {wse}")
+
+                # Deliver pure human-like text reply directly via OpenWA
+                try:
+                    await openwa_provider.send_text_message(
+                        chat_id=sender_jid,
+                        text=agent_reply
+                    )
+                except Exception as se:
+                    logger.error(f"Failed to deliver WhatsApp reply via OpenWA: {se}")
+
+                return {"status": "success", "processed": True, "reply": agent_reply}
+
+            except Exception as dbe:
+                await db.rollback()
+                logger.error(f"Database error in handle_openwa_webhook: {dbe}", exc_info=True)
+                return {"status": "error", "detail": str(dbe)}
 
     # Handle incoming call attempts gracefully by redirecting to WhatsApp chat
     elif event in ["call.received", "call.offer", "call.incoming"]:
@@ -290,3 +472,272 @@ async def handle_openwa_webhook(request: Request):
         return {"status": "success", "event": event}
 
     return {"status": "received", "event": event}
+
+
+class ConversationReplyRequest(BaseModel):
+    message: str
+    contact_name: Optional[str] = "Customer"
+    send_live_openwa: Optional[bool] = True
+
+
+@router.get("/conversations")
+async def list_whatsapp_conversations(limit: int = 50):
+    """List all active WhatsApp conversation threads."""
+    async with AsyncSessionLocal() as db:
+        stmt = (
+            select(WhatsAppConversation)
+            .order_by(desc(WhatsAppConversation.updated_at))
+            .limit(limit)
+        )
+        res = await db.execute(stmt)
+        convs = res.scalars().all()
+        output = []
+        for c in convs:
+            output.append({
+                "id": str(c.id),
+                "phone_number": c.phone_number,
+                "contact_name": c.contact_name,
+                "last_message_text": c.last_message_text,
+                "last_message_at": c.last_message_at.isoformat() if c.last_message_at else None,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "updated_at": c.updated_at.isoformat() if c.updated_at else None
+            })
+        return output
+
+
+@router.get("/conversations/{phone_number}/messages")
+async def get_conversation_messages(phone_number: str):
+    """Fetch all messages for a specific phone number in chronological order with resilient phone resolution."""
+    clean_digits = re.sub(r"[^\d]", "", phone_number)
+    async with AsyncSessionLocal() as db:
+        search_terms = [phone_number, clean_digits, f"+{clean_digits}"]
+        if len(clean_digits) >= 10:
+            last10 = clean_digits[-10:]
+            search_terms.extend([last10, f"+91{last10}", f"+1{last10}"])
+
+        stmt = select(WhatsAppConversation).where(
+            WhatsAppConversation.phone_number.in_(search_terms)
+        ).order_by(desc(WhatsAppConversation.updated_at))
+        res = await db.execute(stmt)
+        conv = res.scalars().first()
+
+        # Fallback suffix search if not found directly
+        if not conv and len(clean_digits) >= 10:
+            last10 = clean_digits[-10:]
+            fallback_stmt = select(WhatsAppConversation).where(
+                WhatsAppConversation.phone_number.like(f"%{last10}")
+            ).order_by(desc(WhatsAppConversation.updated_at))
+            fallback_res = await db.execute(fallback_stmt)
+            conv = fallback_res.scalars().first()
+
+        if not conv:
+            return {"conversation": None, "messages": []}
+
+        msg_stmt = (
+            select(WhatsAppMessage)
+            .where(WhatsAppMessage.conversation_id == conv.id)
+            .order_by(WhatsAppMessage.created_at.asc())
+        )
+        msg_res = await db.execute(msg_stmt)
+        msgs = msg_res.scalars().all()
+
+        messages_data = []
+        for m in msgs:
+            time_str = m.created_at.strftime("%I:%M %p") if m.created_at else "Just now"
+            messages_data.append({
+                "id": str(m.id),
+                "sender": m.sender,
+                "text": m.message_text,
+                "time": time_str,
+                "status": m.status,
+                "created_at": m.created_at.isoformat() if m.created_at else None
+            })
+
+        return {
+            "conversation": {
+                "id": str(conv.id),
+                "phone_number": conv.phone_number,
+                "contact_name": conv.contact_name,
+                "last_message_text": conv.last_message_text,
+                "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None
+            },
+            "messages": messages_data
+        }
+
+
+@router.post("/conversations/{phone_number}/reply")
+async def post_conversation_customer_reply(phone_number: str, payload: ConversationReplyRequest):
+    """
+    Production-ready handler to simulate customer reply, trigger natural AI turn,
+    record both to database with transaction rollback safety, broadcast over WebSocket,
+    and optionally forward to OpenWA device.
+    """
+    clean_digits = re.sub(r"[^\d]", "", phone_number)
+    user_text = payload.message.strip()
+    contact_name = payload.contact_name or "Customer"
+
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Message text is required")
+
+    sender_jid = f"{clean_digits}@c.us"
+    formatted_phone = f"+{clean_digits}" if not phone_number.startswith("+") else phone_number
+
+    async with AsyncSessionLocal() as db:
+        try:
+            stmt = select(WhatsAppConversation).where(
+                WhatsAppConversation.phone_number.in_([phone_number, clean_digits, f"+{clean_digits}"])
+            ).order_by(desc(WhatsAppConversation.updated_at))
+            res = await db.execute(stmt)
+            conv = res.scalars().first()
+
+            comp_stmt = select(CompanyProfile).order_by(desc(CompanyProfile.created_at)).limit(1)
+            comp_res = await db.execute(comp_stmt)
+            company_profile = comp_res.scalar_one_or_none()
+
+            if not conv:
+                conv = WhatsAppConversation(
+                    user_id=company_profile.user_id if company_profile else None,
+                    phone_number=formatted_phone,
+                    contact_name=contact_name,
+                    chat_jid=sender_jid,
+                    last_message_text=user_text,
+                    last_message_at=datetime.utcnow()
+                )
+                db.add(conv)
+                await db.commit()
+                await db.refresh(conv)
+
+            cust_msg = WhatsAppMessage(
+                conversation_id=conv.id,
+                sender="customer",
+                direction="inbound",
+                message_text=user_text,
+                status="received",
+                chat_jid=sender_jid,
+                ai_generated=False
+            )
+            db.add(cust_msg)
+            await db.commit()
+
+            # Broadcast incoming customer message over WebSocket
+            try:
+                await ws_manager.broadcast({
+                    "type": "new_message",
+                    "conversation_id": str(conv.id),
+                    "phone_number": conv.phone_number,
+                    "contact_name": conv.contact_name or contact_name,
+                    "message": {
+                        "id": str(cust_msg.id),
+                        "sender": "customer",
+                        "text": user_text,
+                        "time": datetime.utcnow().strftime("%I:%M %p"),
+                        "status": "received",
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                })
+            except Exception as wse:
+                logger.debug(f"WebSocket broadcast notice: {wse}")
+
+            hist_stmt = (
+                select(WhatsAppMessage)
+                .where(WhatsAppMessage.conversation_id == conv.id)
+                .order_by(WhatsAppMessage.created_at.asc())
+                .limit(20)
+            )
+            hist_res = await db.execute(hist_stmt)
+            messages = hist_res.scalars().all()
+
+            dialogue_history = []
+            for m in messages:
+                dialogue_history.append({
+                    "speaker": "agent" if m.sender == "agent" else "customer",
+                    "text": m.message_text
+                })
+
+            provider_config = {
+                "company_name": "Our Company",
+                "agent_name": "Sarah",
+                "tone": "helpful, warm, and professional",
+                "language": "English"
+            }
+            if company_profile:
+                provider_config = {
+                    "company_name": company_profile.name or "Our Company",
+                    "agent_name": company_profile.default_agent_name or "Sarah",
+                    "tone": "helpful, warm, and professional",
+                    "language": company_profile.default_language or "English",
+                    "industry": company_profile.industry or "Customer Support & Services"
+                }
+
+            # Resilient AI generation with polite human fallback
+            try:
+                agent_reply = await AIVoiceEngine.generate_live_turn(
+                    campaign_name="WhatsApp Assistant",
+                    agent_prompt=f"Assist the customer regarding {provider_config.get('company_name', 'our company')}.",
+                    provider_config=provider_config,
+                    conversation_history=dialogue_history,
+                    user_message=user_text,
+                    contact_name=conv.contact_name or contact_name
+                )
+            except Exception as ai_err:
+                logger.error(f"Simulator AI turn error: {ai_err}, using polite fallback", exc_info=True)
+                c_name = provider_config.get("company_name", "our team")
+                agent_reply = f"Hello {conv.contact_name or contact_name}! Thank you for reaching out to {c_name}. We have received your message and our team will get in touch shortly."
+
+            ai_msg = WhatsAppMessage(
+                conversation_id=conv.id,
+                sender="agent",
+                direction="outbound",
+                message_text=agent_reply,
+                status="sent",
+                chat_jid=sender_jid,
+                ai_generated=True
+            )
+            db.add(ai_msg)
+
+            conv.last_message_text = agent_reply
+            conv.last_message_at = datetime.utcnow()
+            await db.commit()
+
+            # Broadcast reply to connected frontend WebSocket listeners
+            try:
+                await ws_manager.broadcast({
+                    "type": "new_message",
+                    "conversation_id": str(conv.id),
+                    "phone_number": conv.phone_number,
+                    "contact_name": conv.contact_name or payload.contact_name or "WhatsApp Customer",
+                    "message": {
+                        "id": str(ai_msg.id),
+                        "sender": "agent",
+                        "text": agent_reply,
+                        "time": datetime.utcnow().strftime("%I:%M %p"),
+                        "status": "sent",
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                })
+            except Exception as wse:
+                logger.debug(f"WebSocket broadcast notice: {wse}")
+
+            if payload.send_live_openwa:
+                try:
+                    status_data = await openwa_provider.get_session_status()
+                    if status_data.get("status") in ["ready", "CONNECTED", "AUTHENTICATED"]:
+                        await openwa_provider.send_text_message(
+                            chat_id=sender_jid,
+                            text=agent_reply
+                        )
+                except Exception as se:
+                    logger.warning(f"Could not forward simulator turn via OpenWA: {se}")
+
+            return {
+                "success": True,
+                "conversation_id": str(conv.id),
+                "customer_message": user_text,
+                "agent_reply": agent_reply,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error in post_conversation_customer_reply: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+

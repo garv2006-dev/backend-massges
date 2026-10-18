@@ -856,10 +856,10 @@ async def send_sequential_step(
 
     if openwa_live:
         try:
-            # Send pure text message
+            # Send pure text message (clean and personal)
             text_res = await openwa_provider.send_text_message(
                 chat_id=chat_jid,
-                text=f"📢 {company_name}:\n\n{message_text}"
+                text=message_text
             )
             openwa_res = text_res
             if text_res and text_res.get("id"):
@@ -1020,11 +1020,11 @@ async def handle_customer_reply(
         intent = "Opt Out / Not Interested"
         sentiment = "neutral"
 
-    # 6. Forward to live OpenWA chat
+    # 6. Forward to live OpenWA chat (clean human text, no robot emoji)
     try:
         await openwa_provider.send_text_message(
             chat_id=chat_jid,
-            text=f"🤖 {agent_name} ({company_name}):\n{agent_reply}"
+            text=agent_reply
         )
     except Exception as we:
         logger.warning(f"Live OpenWA forward exception: {we}")

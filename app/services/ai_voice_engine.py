@@ -77,7 +77,7 @@ Also analyze the conversation and return ONLY a valid JSON object formatted as:
 """
                 client = genai.Client(api_key=settings.GEMINI_API_KEY)
                 response = None
-                for model_name in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
+                for model_name in ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
                     try:
                         response = await client.aio.models.generate_content(
                             model=model_name,
@@ -200,16 +200,21 @@ Also analyze the conversation and return ONLY a valid JSON object formatted as:
 
         if genai and settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
             try:
-                system_prompt = f"""
-You are {agent_name}, representing {company_name} on WhatsApp.
+                system_prompt = f"""You are {agent_name}, a friendly, courteous, and professional human team representative for {company_name} chatting with a customer on WhatsApp.
 Tone: {tone}
 Language: {language}
-Goal & Guidelines:
+Business Context & Guidelines:
 {instructions}
 
 Customer Name: {contact_name}
 
-Respond in 1-2 natural, polite, and helpful sentences as a human customer support or relationship manager chatting on WhatsApp. Keep it concise, friendly, and human-like. Do not use phone call terms or robotic phrasing.
+CRITICAL COMMUNICATION RULES:
+1. Act 100% as a real human. NEVER mention you are an AI, bot, language model, automated system, or virtual assistant.
+2. Reply in 1-2 natural, polite, and helpful sentences directly addressing what the customer said.
+3. If the customer sent a simple greeting like "hi", "hello", "hey", or "good morning", greet them back warmly by name and politely ask how you can help them today regarding {company_name}.
+4. If the customer asks about pricing, packages, or details, acknowledge enthusiastically and offer the next step (e.g. sharing details right here or setting up a short demo).
+5. If the customer replies in Hindi, Hinglish, or Gujarati, match their language naturally.
+6. Keep messages clean, concise, and friendly. Do not use robotic jargon, system disclaimers, or awkward formal templates.
 """
                 client = genai.Client(api_key=settings.GEMINI_API_KEY)
                 
@@ -218,38 +223,60 @@ Respond in 1-2 natural, polite, and helpful sentences as a human customer suppor
                 prompt = f"Chat History:\n{history_text}\nCustomer just messaged: \"{user_message}\"\nYour response as {agent_name}:"
                 
                 config = types.GenerateContentConfig(system_instruction=system_prompt) if types else None
-                response = await client.aio.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=prompt,
-                    config=config
-                )
-                if response and response.text:
-                    return response.text.strip()
+                response = None
+                for candidate_model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+                    try:
+                        response = await client.aio.models.generate_content(
+                            model=candidate_model,
+                            contents=prompt,
+                            config=config
+                        )
+                        if response and response.text:
+                            return response.text.strip()
+                    except Exception as model_err:
+                        logger.debug(f"Model {candidate_model} notice: {model_err}")
+                        continue
             except Exception as e:
                 logger.warning(f"Gemini live turn failed, using fallback: {e}")
 
-        # Intelligent conversational response logic
-        msg_lower = user_message.lower()
+        # Intelligent conversational fallback response logic
+        msg_lower = user_message.lower().strip()
+        
+        # Gujarati handling
         if "gujarat" in language.lower():
-            if any(w in msg_lower for w in ["હા", "હાજી", "yes", "વિગત", "માહિતી", "details"]):
-                return f"ચોક્કસ {contact_name} જી, અમે તમને બધી માહિતી મોકલી આપીશું. શું તમને બીજો કોઈ પ્રશ્ન છે?"
+            if any(w in msg_lower for w in ["hi", "hello", "hey", "નમસ્તે", "કેમ છો", "હેલો"]):
+                return f"નમસ્તે {contact_name} જી! કેમ છો? હું {company_name} તરફથી તમારી શું મદદ કરી શકું?"
+            if any(w in msg_lower for w in ["હા", "હાજી", "yes", "વિગત", "માહિતી", "details", "ભાવ", "price"]):
+                return f"ચોક્કસ {contact_name} જી, અમે તમને બધી વિગતો મોકલી આપીશું. શું તમને કોઈ ચોક્કસ સેવા અંગે પૂછપરછ છે?"
             if any(w in msg_lower for w in ["ના", "no", "પછી", "busy"]):
                 return f"સમજી ગયો {contact_name} જી, અમે તમને અનુકૂળ સમયે ફરીથી સંપર્ક કરીશું. આભાર!"
             return f"ખૂબ આભાર {contact_name} જી. {company_name} તરફથી અમે તમને શ્રેષ્ઠ સેવા આપીશું!"
 
-        if "hindi" in language.lower():
-            if any(w in msg_lower for w in ["हाँ", "yes", "बताओ", "डिटेल्स", "price", "demo"]):
-                return f"जी बिल्कुल {contact_name} जी! हम आपको तुरंत सारी डिटेल्स शेयर कर रहे हैं। क्या आप इस हफ्ते डेमो के लिए उपलब्ध होंगे?"
-            if any(w in msg_lower for w in ["नहीं", "no", "बाद में", "busy"]):
-                return f"कोई बात नहीं {contact_name} जी, मैं आपको बाद में कॉल कर लूँगी। आपका दिन शुभ रहे!"
-            return f"धन्यवाद {contact_name} जी! {company_name} हमेशा आपकी सेवा में तत्पर है।"
+        # Hindi / Hinglish handling
+        if "hindi" in language.lower() or any(w in msg_lower for w in ["namaste", "kaise", "batao", "kya", "shukriya"]):
+            if any(w in msg_lower for w in ["hi", "hello", "hey", "नमस्ते", "नमस्कार", "हेलो", "हाय"]):
+                return f"नमस्ते {contact_name} जी! कैसे हैं आप? मैं {company_name} की तरफ से आपकी क्या सहायता कर सकती हूँ?"
+            if any(w in msg_lower for w in ["हाँ", "yes", "बताओ", "डिटेल्स", "price", "demo", "rate", "cost"]):
+                return f"जी बिल्कुल {contact_name} जी! हमारे पास कई बेहतरीन पैकेजेस हैं। क्या मैं आपको यहाँ पूरी डिटेल्स शेयर कर दूँ?"
+            if any(w in msg_lower for w in ["नहीं", "no", "बाद में", "busy", "kal"]):
+                return f"कोई बात नहीं {contact_name} जी, आप जब भी फ्री हों मुझे बता दीजिएगा। आपका दिन शुभ रहे!"
+            return f"धन्यवाद {contact_name} जी! {company_name} की तरफ से हम आपकी पूरी सहायता के लिए हमेशा तैयार हैं।"
 
-        # English
-        if any(w in msg_lower for w in ["yes", "sure", "tell me", "details", "cost", "price", "demo", "interested"]):
-            return f"That sounds great, {contact_name}! I can send over our full service overview right now, or schedule a quick 5-minute walk-through for you."
-        if any(w in msg_lower for w in ["no", "not now", "busy", "later", "call back"]):
-            return f"I completely understand, {contact_name}. When would be a more convenient time for us to follow up with you?"
-        if any(w in msg_lower for w in ["who", "what", "company", "explain"]):
-            return f"We are {company_name}, and we specialize in automated AI intelligence to accelerate your business communications."
-        
-        return f"Thank you for sharing that, {contact_name}. Is there any specific detail or question you would like me to cover for you today?"
+        # English handling
+        # 1. Greetings ("hi", "hello", "hey")
+        if any(msg_lower == w or msg_lower.startswith(w + " ") for w in ["hi", "hello", "hey", "hola", "good morning", "good afternoon", "good evening"]):
+            return f"Hello {contact_name}! Great to connect with you. How can I help you today regarding {company_name}?"
+
+        # 2. Interest / Pricing / Details
+        if any(w in msg_lower for w in ["yes", "sure", "tell me", "details", "cost", "price", "demo", "interested", "info", "package"]):
+            return f"That sounds wonderful, {contact_name}! We offer tailored plans designed for your needs. Would you like me to share our full overview right here, or arrange a quick 5-minute call?"
+
+        # 3. Busy / Not interested
+        if any(w in msg_lower for w in ["no", "not now", "busy", "later", "call back", "stop", "unsubscribe"]):
+            return f"I completely understand, {contact_name}. Thank you for letting me know, and feel free to reach out anytime when it's convenient for you!"
+
+        # 4. Identity / Who is this?
+        if any(w in msg_lower for w in ["who", "what", "which company", "explain", "koun"]):
+            return f"This is {agent_name} from {company_name}. We reached out regarding our services to see how we could assist you. How can I best help you today?"
+
+        return f"Thank you for reaching out, {contact_name}! How may I assist you with {company_name} today?"

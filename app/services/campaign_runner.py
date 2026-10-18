@@ -169,7 +169,7 @@ class CampaignRunnerService:
                             if status_data.get("status") in ["ready", "CONNECTED", "AUTHENTICATED"]:
                                 send_res = await openwa_provider.send_text_message(
                                     chat_id=chat_jid,
-                                    text=f"📢 {company_name}:\n\n{message_text}"
+                                    text=message_text
                                 )
                                 if send_res and isinstance(send_res, dict):
                                     msg.openwa_message_id = str(send_res.get("id") or "")

@@ -1,6 +1,6 @@
 from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, func, delete as sql_delete
 from app.models.campaign import Campaign
 from app.models.campaign_contact import CampaignContact
 from app.schemas.campaign import CampaignCreate, CampaignUpdate, CampaignContactCreate
@@ -49,6 +49,7 @@ class CampaignRepository:
         if not db_campaign:
             return False
         
+        await self.db.execute(sql_delete(CampaignContact).where(CampaignContact.campaign_id == campaign_id))
         await self.db.delete(db_campaign)
         await self.db.commit()
         return True
