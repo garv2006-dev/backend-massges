@@ -65,24 +65,7 @@ class CallInDB(CallBase):
 class Call(CallInDB):
     pass
 
-class CallEventBase(BaseModel):
-    call_id: uuid.UUID
-    event_type: str
-    event_data: Optional[dict] = None
-    description: Optional[str] = None
 
-class CallEventCreate(CallEventBase):
-    pass
-
-class CallEventInDB(CallEventBase):
-    id: uuid.UUID
-    timestamp: datetime
-
-    class Config:
-        from_attributes = True
-
-class CallEvent(CallEventInDB):
-    pass
 
 class TranscriptBase(BaseModel):
     full_transcript: Optional[str] = None

@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.database import get_db
 from app.schemas.contact import Contact, ContactCreate, ContactUpdate, ContactImport
 from app.schemas.common import MessageResponse
@@ -12,9 +12,10 @@ from app.utils.phone import normalize_phone_number
 import uuid
 
 router = APIRouter()
+MAX_UPLOAD_SIZE = 25 * 1024 * 1024  # 25 MB limit
 
 class BatchContactsCreate(BaseModel):
-    contacts: List[ContactCreate]
+    contacts: List[ContactCreate] = Field(..., min_length=1, max_length=1000, description="List of contacts to create")
 
 @router.post("/import", response_model=Dict[str, Any])
 async def import_contacts(
@@ -41,6 +42,12 @@ async def import_contacts(
         )
     
     content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Uploaded file exceeds maximum allowed limit of {MAX_UPLOAD_SIZE // (1024*1024)}MB."
+        )
+
     excel_service = ExcelService(db)
     try:
         import_id, result = await excel_service.import_contacts(
@@ -62,8 +69,8 @@ async def import_contacts(
 
 @router.get("/imports", response_model=list[ContactImport])
 async def list_imports(
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
@@ -74,8 +81,8 @@ async def list_imports(
 
 @router.get("", response_model=list[Contact])
 async def list_contacts(
-    skip: int = 0,
-    limit: int = 100,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
     import_id: uuid.UUID = None,
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)

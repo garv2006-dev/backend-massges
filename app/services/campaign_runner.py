@@ -12,7 +12,7 @@ from app.models.contact import Contact
 from app.models.call import Call, CallStatus, CallDirection
 from app.models.transcript import Transcript
 from app.models.extracted_call_result import ExtractedCallResult
-from app.integrations.telephony.twilio import TwilioTelephonyProvider
+from app.integrations.telephony.openwa import OpenWATelephonyProvider
 from app.repositories.campaign import CampaignRepository
 from app.services.ai_voice_engine import AIVoiceEngine
 from app.config import settings
@@ -86,17 +86,16 @@ class CampaignRunnerService:
                     await db.commit()
                 return
 
-            # Initialize Telephony Provider if Twilio is configured
-            twilio_provider = None
+            # Initialize OpenWA Telephony Provider (WhatsApp Gateway)
+            openwa_provider = None
             try:
-                provider = TwilioTelephonyProvider()
-                if provider.client and provider.from_number:
-                    twilio_provider = provider
+                openwa_provider = OpenWATelephonyProvider()
             except Exception as e:
-                logger.info(f"Twilio provider not active: {e}")
+                logger.info(f"OpenWA provider initialization notice: {e}")
 
             provider_config = campaign.provider_config or {}
-            use_real_twilio = provider_config.get("use_real_twilio", True)
+            # Check if OpenWA mode is requested (defaults to True if configured or explicitly requested)
+            use_openwa = provider_config.get("use_openwa", provider_config.get("use_real_twilio", False))
 
             for cc, contact in pending_items:
                 # Check if campaign was paused or cancelled by employee
@@ -122,35 +121,48 @@ class CampaignRunnerService:
                     direction=CallDirection.OUTBOUND,
                     status=CallStatus.IN_PROGRESS,
                     started_at=datetime.utcnow(),
-                    provider="twilio" if (use_real_twilio and twilio_provider) else "ai_voice_engine"
+                    provider="openwa" if (use_openwa and openwa_provider) else "ai_voice_engine"
                 )
                 db.add(call_record)
                 await db.commit()
                 await db.refresh(call_record)
 
                 try:
-                    # If real Twilio mode is requested
-                    if use_real_twilio and twilio_provider:
-                        webhook_url = None
-                        if settings.PUBLIC_WEBHOOK_URL:
-                            webhook_url = f"{settings.PUBLIC_WEBHOOK_URL.rstrip('/')}/api/telephony/twiml/{call_record.id}"
+                    # If real OpenWA WhatsApp calling mode is active
+                    if use_openwa and openwa_provider:
+                        opening_line = (
+                            provider_config.get("opening_line")
+                            or f"Hello {contact_name}! This is {provider_config.get('agent_name', 'AI Assistant')} calling from {provider_config.get('company_name', 'our company')}. How may I help you today?"
+                        )
 
                         try:
-                            res = await twilio_provider.create_call(
-                                to_number=target_phone,
-                                webhook_url=webhook_url,
-                                metadata={"call_id": str(call_record.id)}
+                            res = await openwa_provider.create_call(
+                                phone_number=target_phone,
+                                speech_text=opening_line,
+                                voice=provider_config.get("voice", "en-IN-NeerjaNeural"),
+                                metadata={
+                                    "call_id": str(call_record.id),
+                                    "campaign_id": str(campaign_id),
+                                    "contact_id": str(contact.id)
+                                }
                             )
                             call_record.provider_call_id = res.get("provider_call_id")
                             call_record.status = CallStatus.IN_PROGRESS
                             cc.status = CampaignContactStatus.IN_PROGRESS
-                            logger.info(f"Twilio call successfully initiated to {target_phone} (SID: {res.get('provider_call_id')})")
-                        except Exception as te:
-                            logger.error(f"Twilio call failed to {target_phone}: {te}")
-                            raw_err = str(te)
-                            clean_err = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', raw_err).strip()
-                            if "verified recipient" in clean_err.lower() or "unverified" in clean_err.lower() or "trial" in clean_err.lower():
-                                clean_err = f"Twilio Trial Account: Phone {target_phone} is unverified. Add it to Twilio Console -> Verified Caller IDs or upgrade your account."
+
+                            # Record opening message turn in Transcript
+                            timestamp_str = datetime.utcnow().strftime("%M:%S")
+                            tr = Transcript(
+                                call_id=call_record.id,
+                                full_transcript=f"[{timestamp_str}] AI Agent: {opening_line}",
+                                word_count=len(opening_line.split()),
+                                language_detected=provider_config.get("language", "English")
+                            )
+                            db.add(tr)
+                            logger.info(f"OpenWA WhatsApp call initiated to {target_phone} (Message ID: {res.get('provider_call_id')})")
+                        except Exception as oe:
+                            logger.error(f"OpenWA call failed to {target_phone}: {oe}")
+                            clean_err = f"OpenWA Gateway Error: {str(oe)}. Ensure OpenWA Docker container is running on http://localhost:2785."
 
                             call_record.status = CallStatus.FAILED
                             call_record.failure_reason = clean_err

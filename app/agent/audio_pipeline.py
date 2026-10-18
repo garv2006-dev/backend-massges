@@ -7,7 +7,7 @@ and supports barge-in interruption handling.
 
 import asyncio
 import logging
-from typing import Dict, Optional, AsyncGenerator
+from typing import Dict, Optional, AsyncGenerator, Any
 import edge_tts
 from app.agent.graph.builder import build_voice_agent_graph
 from app.agent.graph.checkpointer import get_stable_thread_id, get_checkpointer

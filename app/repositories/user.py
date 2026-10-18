@@ -23,7 +23,8 @@ class UserRepository:
             hashed_password=hashed_password,
             full_name=user_create.full_name,
             is_active=user_create.is_active,
-            is_superuser=user_create.is_superuser
+            is_superuser=user_create.is_superuser,
+            onboarding_completed=user_create.onboarding_completed
         )
         self.db.add(db_user)
         await self.db.commit()

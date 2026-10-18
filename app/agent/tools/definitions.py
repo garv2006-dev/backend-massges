@@ -14,8 +14,6 @@ from app.models.contact import Contact
 from app.models.campaign import Campaign
 from app.models.call import Call, CallStatus
 from app.models.extracted_call_result import ExtractedCallResult
-from app.models.call_follow_up import CallFollowUp
-from app.models.call_event import CallEvent
 from app.agent.tools.schemas import (
     GetContactDetailsInput,
     GetCampaignContextInput,
@@ -410,21 +408,18 @@ def create_agent_tools(context: ToolSecurityContext, db_session: Optional[AsyncS
             except Exception:
                 raise ToolSecurityError(f"Invalid datetime format: {scheduled_iso}. Expected ISO 8601.")
 
-            follow_up = CallFollowUp(
-                call_id=call.id,
-                contact_id=contact_uuid,
-                campaign_id=call.campaign_id,
-                organization_id=uuid.UUID(context.organization_id) if context.organization_id else None,
-                scheduled_time=sched_dt,
-                channel=channel or "voice",
-                status="scheduled",
-                notes=notes
-            )
-            db.add(follow_up)
+            # Store follow-up in ExtractedCallResult
+            stmt = select(ExtractedCallResult).where(ExtractedCallResult.call_id == call.id)
+            res = await db.execute(stmt)
+            extracted = res.scalar_one_or_none()
+            if not extracted:
+                extracted = ExtractedCallResult(call_id=call.id)
+                db.add(extracted)
+            extracted.follow_up_required = "yes"
+            extracted.follow_up_notes = f"Scheduled {channel} for {sched_dt.isoformat()}: {notes or ''}"
             await db.commit()
             return {
                 "status": "scheduled",
-                "follow_up_id": str(follow_up.id),
                 "scheduled_time": sched_dt.isoformat(),
                 "channel": channel
             }
@@ -496,14 +491,6 @@ def create_agent_tools(context: ToolSecurityContext, db_session: Optional[AsyncS
                     "reason": reason
                 }
 
-            # Record event
-            event = CallEvent(
-                call_id=call.id,
-                event_type="transfer_requested",
-                event_data={"reason": reason, "department": department},
-                description=f"Transfer to human agent requested: {reason}"
-            )
-            db.add(event)
             await db.commit()
 
             return {
@@ -575,13 +562,6 @@ def create_agent_tools(context: ToolSecurityContext, db_session: Optional[AsyncS
             call.status = CallStatus.COMPLETED
             call.ended_at = datetime.utcnow()
 
-            event = CallEvent(
-                call_id=call.id,
-                event_type="call_ended_by_agent",
-                event_data={"hangup_reason": hangup_reason, "opt_out": customer_consented_or_opt_out},
-                description=f"Call termination initiated by AI agent: {hangup_reason}"
-            )
-            db.add(event)
             await db.commit()
 
             return {

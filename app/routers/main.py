@@ -1,10 +1,11 @@
 from fastapi import APIRouter
-from app.api import auth, contacts, campaigns, dashboard, agent, telephony
+from app.api import auth, contacts, campaigns, dashboard, agent, telephony, company
 
 router = APIRouter()
 
 # Include API routers
 router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+router.include_router(company.router, prefix="/company", tags=["Company & WhatsApp"])
 router.include_router(contacts.router, prefix="/contacts", tags=["Contacts"])
 router.include_router(campaigns.router, prefix="/campaigns", tags=["Campaigns"])
 router.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])

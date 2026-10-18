@@ -54,9 +54,38 @@ async def login(
         )
     
     access_token = create_access_token(subject=str(user.id))
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "onboarding_completed": bool(getattr(user, "onboarding_completed", False)),
+        "user": user,
+    }
 
 @router.get("/me", response_model=User)
 async def get_current_user_info(current_user = Depends(get_current_user)):
     """Get current user information."""
+    return current_user
+
+@router.post("/complete-onboarding", response_model=User)
+async def complete_onboarding(
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Mark the current authenticated user's onboarding as completed."""
+    current_user.onboarding_completed = True
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+@router.post("/reset-onboarding", response_model=User)
+async def reset_onboarding(
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reset the current authenticated user's onboarding status for testing."""
+    current_user.onboarding_completed = False
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
     return current_user

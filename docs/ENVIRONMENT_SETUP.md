@@ -138,54 +138,43 @@ DEEPGRAM_API_KEY=your-deepgram-api-key-here
 
 ---
 
-### Telephony Provider Configuration (Twilio)
+### WhatsApp Telephony Gateway Configuration (OpenWA)
 
 ```bash
-# Twilio Account SID
-TWILIO_ACCOUNT_SID=your-twilio-account-sid
+# OpenWA Gateway Base URL (Dashboard & API on port 2785)
+OPENWA_BASE_URL=http://localhost:2785
 
-# Twilio Auth Token
-TWILIO_AUTH_TOKEN=your-twilio-auth-token
+# WhatsApp Session ID
+OPENWA_SESSION_ID=default
 
-# Twilio Phone Number
-TWILIO_PHONE_NUMBER=+1234567890
+# OpenWA API Key (optional)
+OPENWA_API_KEY=your-openwa-api-key
 
-# Twilio API Key (optional, for enhanced security)
-TWILIO_API_KEY=your-twilio-api-key
+# OpenWA Webhook Secret (optional HMAC)
+OPENWA_WEBHOOK_SECRET=your-webhook-secret
 
-# Twilio API Secret (optional)
-TWILIO_API_SECRET=your-twilio-api-secret
-
-# Public Webhook URL (for development with ngrok)
-PUBLIC_WEBHOOK_URL=https://your-ngrok-url.ngrok-free.app
+# Public Webhook URL (for development with Cloudflare Tunnel or ngrok)
+PUBLIC_WEBHOOK_URL=https://your-tunnel-url.trycloudflare.com
 ```
 
-**Description**: Configuration for Twilio telephony integration.
+**Description**: Configuration for OpenWA (Open Source WhatsApp API Gateway) telephony integration.
 
-**Required**: Yes (for making/receiving phone calls)
+**Required**: Yes (for WhatsApp outbound AI voice calling & inbound customer calling)
 
-**How to obtain**:
-1. Go to [Twilio Console](https://console.twilio.com/)
-2. Sign up for a Twilio account
-3. Navigate to Account Settings to find Account SID and Auth Token
-4. Purchase or verify a phone number in Phone Numbers section
-5. Optionally create API Key/Secret for enhanced security
+**How to obtain & start OpenWA**:
+1. Run OpenWA via Docker Compose:
+   ```bash
+   docker compose -f docker-compose.openwa.yml up -d
+   ```
+2. Navigate to `http://localhost:2785` or open `/whatsapp-gateway` on your frontend dashboard.
+3. Link your WhatsApp Business or personal account by scanning the QR code in **Linked Devices** on your phone.
+4. Set `PUBLIC_WEBHOOK_URL` in `.env` so OpenWA can route inbound WhatsApp calls and customer voice messages to `/api/telephony/openwa/webhook`.
 
-**TWILIO_ACCOUNT_SID**: Your Twilio account identifier (starts with AC)
+**OPENWA_BASE_URL**: Base URL of your OpenWA instance (defaults to http://localhost:2785)
 
-**TWILIO_AUTH_TOKEN**: Your Twilio authentication token (keep secret)
+**OPENWA_SESSION_ID**: The session identifier (defaults to "default")
 
-**TWILIO_PHONE_NUMBER**: The Twilio phone number to use for outbound calls (E.164 format)
-
-**TWILIO_API_KEY/SECRET**: Optional enhanced credentials (recommended for production)
-
-**PUBLIC_WEBHOOK_URL**: Required for development when using ngrok to expose localhost to Twilio webhooks
-
-**Notes**:
-- Keep TWILIO_AUTH_TOKEN and TWILIO_API_SECRET secure
-- Use E.164 format for phone numbers: +[country code][number]
-- For production, use a dedicated Twilio API Key instead of Auth Token
-- PUBLIC_WEBHOOK_URL is only needed when running locally with ngrok
+**PUBLIC_WEBHOOK_URL**: Required for development when using ngrok or Cloudflare tunnel to route OpenWA webhooks to localhost
 
 ---
 

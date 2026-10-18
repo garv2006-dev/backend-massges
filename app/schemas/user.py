@@ -8,6 +8,7 @@ class UserBase(BaseModel):
     full_name: Optional[str] = None
     is_active: bool = True
     is_superuser: bool = False
+    onboarding_completed: bool = False
 
 class UserCreate(UserBase):
     password: str = Field(..., min_length=8)
@@ -17,6 +18,7 @@ class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     is_active: Optional[bool] = None
     is_superuser: Optional[bool] = None
+    onboarding_completed: Optional[bool] = None
 
 class UserInDB(UserBase):
     id: uuid.UUID
@@ -32,6 +34,8 @@ class User(UserInDB):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    onboarding_completed: Optional[bool] = False
+    user: Optional[User] = None
 
 class TokenData(BaseModel):
     user_id: Optional[uuid.UUID] = None

@@ -79,7 +79,7 @@ class MockGeminiVoiceModel(BaseChatModel):
         # Check for transfer intent
         if any(w in last_human for w in ["transfer", "human", "supervisor", "representative", "manager"]):
             ai_msg = AIMessage(
-                content="I would be happy to connect you with a representative. Please hold on for just a moment.",
+                content="I would be happy to transfer you to a human representative. Please hold on for just a moment.",
                 tool_calls=[{
                     "id": "call_transfer_req",
                     "name": "transfer_to_human",

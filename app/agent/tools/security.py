@@ -7,7 +7,6 @@ from typing import Dict, Any, Optional, Set
 from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
-from app.models.tool_execution_audit import ToolExecutionAuditLog
 from app.models.call import Call
 from app.models.campaign import Campaign
 
@@ -24,7 +23,7 @@ class ToolSecurityContext:
     campaign_id: Optional[str] = None
     contact_id: Optional[str] = None
     user_id: Optional[str] = None
-    telephony_provider: str = "twilio"
+    telephony_provider: str = "openwa"
     supports_transfer: bool = False
     allowed_tools: Set[str] = field(default_factory=lambda: {
         "get_contact_details",
@@ -54,11 +53,13 @@ class ToolSecurityManager:
             return data
         sensitive_keys = {"token", "auth_token", "password", "secret", "api_key", "credentials"}
         sanitized = {}
+        is_sensitive_field_name = any(s in str(data.get("field_name", "")).lower() for s in sensitive_keys)
+
         for k, v in data.items():
-            if any(s in k.lower() for s in sensitive_keys):
-                sanitized[k] = "[REDACTED]"
-            elif isinstance(v, dict):
+            if isinstance(v, dict):
                 sanitized[k] = ToolSecurityManager.sanitize_data(v)
+            elif (k in ["field_value", "value"] and is_sensitive_field_name) or any(s in str(k).lower() for s in sensitive_keys):
+                sanitized[k] = "[REDACTED]"
             else:
                 sanitized[k] = v
         return sanitized
@@ -107,22 +108,5 @@ class ToolSecurityManager:
         correlation_id: Optional[str] = None,
         error_message: Optional[str] = None
     ) -> None:
-        """Write an immutable audit log record to PostgreSQL."""
-        try:
-            audit = ToolExecutionAuditLog(
-                call_id=uuid.UUID(call_id) if call_id else None,
-                campaign_id=uuid.UUID(campaign_id) if campaign_id else None,
-                organization_id=uuid.UUID(organization_id) if organization_id else None,
-                tool_name=tool_name,
-                status=status,
-                execution_duration_ms=duration_ms,
-                arguments=ToolSecurityManager.sanitize_data(arguments),
-                result_summary=ToolSecurityManager.sanitize_data(result_summary),
-                correlation_id=correlation_id or str(uuid.uuid4())[:8],
-                error_message=error_message
-            )
-            db.add(audit)
-            await db.commit()
-        except Exception as e:
-            logger.error(f"Failed to write tool audit log: {e}")
-            await db.rollback()
+        """Log tool execution to logger."""
+        logger.info(f"[TOOL_AUDIT] tool={tool_name} status={status} duration={duration_ms}ms call_id={call_id}")

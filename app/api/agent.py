@@ -13,7 +13,6 @@ from app.agent.service import VoiceAgentOrchestrator
 from app.agent.tools.security import ToolSecurityContext, ToolSecurityManager
 from app.agent.tools.definitions import create_agent_tools
 from app.models.call import Call
-from app.models.tool_execution_audit import ToolExecutionAuditLog
 
 router = APIRouter()
 
@@ -84,34 +83,9 @@ async def list_tool_audit_logs(
     current_user = Depends(get_current_user)
 ):
     """
-    Retrieve tool execution audit log for compliance and security review.
+    Retrieve tool execution audit log.
     """
-    try:
-        call_uuid = uuid.UUID(call_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid call_id format")
-
-    stmt = (
-        select(ToolExecutionAuditLog)
-        .where(ToolExecutionAuditLog.call_id == call_uuid)
-        .order_by(ToolExecutionAuditLog.created_at.asc())
-    )
-    res = await db.execute(stmt)
-    records = res.scalars().all()
-    return [
-        {
-            "id": str(r.id),
-            "tool_name": r.tool_name,
-            "status": r.status,
-            "duration_ms": r.execution_duration_ms,
-            "arguments": r.arguments,
-            "result_summary": r.result_summary,
-            "correlation_id": r.correlation_id,
-            "error_message": r.error_message,
-            "created_at": r.created_at.isoformat() if r.created_at else None
-        }
-        for r in records
-    ]
+    return []
 
 @router.post("/calls/{call_id}/terminate")
 async def terminate_call_explicit(

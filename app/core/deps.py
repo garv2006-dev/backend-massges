@@ -24,8 +24,13 @@ async def get_current_user(
     if user_id is None:
         raise credentials_exception
     
+    try:
+        user_uuid = uuid.UUID(str(user_id))
+    except (ValueError, TypeError):
+        raise credentials_exception
+
     user_repo = UserRepository(db)
-    user = await user_repo.get_by_id(uuid.UUID(user_id))
+    user = await user_repo.get_by_id(user_uuid)
     if user is None:
         raise credentials_exception
     

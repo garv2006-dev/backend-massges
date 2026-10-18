@@ -73,7 +73,7 @@ backend/
 │   │   ├── telephony/               # Telephony provider adapters
 │   │   │   ├── __init__.py
 │   │   │   ├── base.py
-│   │   │   └── twilio.py
+│   │   │   └── openwa.py
 │   │   ├── speech_to_text/          # STT providers (Deepgram)
 │   │   │   └── __init__.py
 │   │   ├── llm/                     # LLM providers (Gemini)
@@ -145,9 +145,10 @@ backend/
    - SECRET_KEY: Secret key for JWT tokens
    - GEMINI_API_KEY: Google Gemini API key
    - DEEPGRAM_API_KEY: Deepgram API key
-   - TWILIO_ACCOUNT_SID: Twilio account SID
-   - TWILIO_AUTH_TOKEN: Twilio auth token
-   - TWILIO_PHONE_NUMBER: Twilio phone number
+   - OPENWA_BASE_URL: OpenWA Gateway base URL (default: http://localhost:2785)
+   - OPENWA_SESSION_ID: WhatsApp session ID (default: default)
+   - OPENWA_API_KEY: Optional OpenWA API key
+   - PUBLIC_WEBHOOK_URL: Public URL for OpenWA webhooks
    - REDIS_URL: Redis connection string for background workers
 
 4. Run database migrations:
@@ -220,7 +221,7 @@ alembic downgrade -1
 - **Error recovery** with retry logic
 
 ### Integrations
-- Telephony provider adapters (Twilio)
+- Telephony provider adapters (OpenWA WhatsApp Gateway)
 - Speech-to-text integration (Deepgram)
 - LLM integration (Google Gemini)
 - Text-to-speech integration (Edge-TTS, production providers)

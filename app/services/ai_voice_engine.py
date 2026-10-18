@@ -2,17 +2,16 @@ import json
 import logging
 import random
 from typing import Dict, Any, List, Optional
-import google.generativeai as genai
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-
-# Initialize Gemini if key is provided
-if settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
-    try:
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-    except Exception as e:
-        logger.warning(f"Could not configure Gemini API: {e}")
 
 class AIVoiceEngine:
     """
@@ -42,7 +41,7 @@ class AIVoiceEngine:
         prompt_instructions = agent_prompt or "Inquire about customer satisfaction, answer queries, and discuss potential collaboration."
 
         # Try generating via Gemini API first if configured
-        if settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
+        if genai and settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
             try:
                 system_instruction = f"""
 You are an advanced AI calling agent simulator. Generate a realistic multi-turn voice phone call between:
@@ -76,11 +75,14 @@ Also analyze the conversation and return ONLY a valid JSON object formatted as:
   "summary": "Customer expressed interest and agreed to follow up next Tuesday."
 }}
 """
+                client = genai.Client(api_key=settings.GEMINI_API_KEY)
                 response = None
-                for model_name in ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-pro"]:
+                for model_name in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
                     try:
-                        model = genai.GenerativeModel(model_name)
-                        response = await model.generate_content_async(system_instruction)
+                        response = await client.aio.models.generate_content(
+                            model=model_name,
+                            contents=system_instruction
+                        )
                         if response and response.text:
                             break
                     except Exception:
@@ -196,7 +198,7 @@ Also analyze the conversation and return ONLY a valid JSON object formatted as:
         language = cfg.get("language", "English")
         instructions = agent_prompt or "Help the customer politely, answer questions, and explain our services."
 
-        if settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
+        if genai and settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
             try:
                 system_prompt = f"""
 You are {agent_name}, an AI calling representative at {company_name}.
@@ -209,14 +211,20 @@ Customer Name: {contact_name}
 
 Respond in 1-2 spoken sentences naturally as if speaking on the phone. Do not use bullet points or markdown formatting. Keep it conversational and warm.
 """
-                model = genai.GenerativeModel("gemini-1.5-flash", system_instruction=system_prompt)
+                client = genai.Client(api_key=settings.GEMINI_API_KEY)
                 
                 # Build chat history
                 history_text = "\n".join([f"{turn.get('speaker', 'user')}: {turn.get('text', '')}" for turn in conversation_history])
                 prompt = f"Call History:\n{history_text}\nCustomer just said: \"{user_message}\"\nYour response as {agent_name}:"
                 
-                response = await model.generate_content_async(prompt)
-                return response.text.strip()
+                config = types.GenerateContentConfig(system_instruction=system_prompt) if types else None
+                response = await client.aio.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt,
+                    config=config
+                )
+                if response and response.text:
+                    return response.text.strip()
             except Exception as e:
                 logger.warning(f"Gemini live turn failed, using fallback: {e}")
 

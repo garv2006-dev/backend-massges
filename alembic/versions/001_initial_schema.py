@@ -149,21 +149,6 @@ def upgrade():
     op.create_index(op.f('ix_calls_provider_call_id'), 'calls', ['provider_call_id'], unique=False)
     op.create_index(op.f('ix_calls_status'), 'calls', ['status'], unique=False)
 
-    # Create call_events table
-    op.create_table('call_events',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('call_id', postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column('event_type', sa.String(50), nullable=False),
-        sa.Column('event_data', sa.JSON(), nullable=True),
-        sa.Column('description', sa.Text(), nullable=True),
-        sa.Column('timestamp', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.ForeignKeyConstraint(['call_id'], ['calls.id'], ondelete='CASCADE')
-    )
-    op.create_index(op.f('ix_call_events_call_id'), 'call_events', ['call_id'], unique=False)
-    op.create_index(op.f('ix_call_events_event_type'), 'call_events', ['event_type'], unique=False)
-    op.create_index(op.f('ix_call_events_id'), 'call_events', ['id'], unique=False)
-    op.create_index(op.f('ix_call_events_timestamp'), 'call_events', ['timestamp'], unique=False)
-
     # Create transcripts table
     op.create_table('transcripts',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
@@ -199,87 +184,32 @@ def upgrade():
     op.create_index(op.f('ix_extracted_call_results_call_id'), 'extracted_call_results', ['call_id'], unique=True)
     op.create_index(op.f('ix_extracted_call_results_id'), 'extracted_call_results', ['id'], unique=False)
 
-    # Create provider_configurations table
-    op.create_table('provider_configurations',
+    # Create company_profiles table
+    op.create_table('company_profiles',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('provider_type', sa.Enum('telephony', 'stt', 'llm', 'tts', name='providertype'), nullable=False),
-        sa.Column('provider_name', sa.String(50), nullable=False),
-        sa.Column('is_active', sa.String(20), default='true'),
-        sa.Column('configuration', sa.JSON(), nullable=True),
-        sa.Column('display_name', sa.String(255), nullable=True),
-        sa.Column('description', sa.Text(), nullable=True),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True, unique=True),
+        sa.Column('name', sa.String(255), nullable=False, server_default=''),
+        sa.Column('phone_number', sa.String(50), nullable=False, server_default=''),
+        sa.Column('email', sa.String(255), nullable=True),
+        sa.Column('industry', sa.String(255), server_default='Customer Service & Sales Automation', nullable=True),
+        sa.Column('website', sa.String(255), nullable=True),
+        sa.Column('default_agent_name', sa.String(100), server_default='Sarah', nullable=True),
+        sa.Column('default_voice', sa.String(100), server_default='en-IN-NeerjaNeural', nullable=True),
+        sa.Column('default_language', sa.String(100), server_default='English', nullable=True),
+        sa.Column('simulated_connected', sa.Boolean(), server_default='false', nullable=False),
+        sa.Column('whatsapp_phone', sa.String(50), server_default='', nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()'))
+        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()')),
+        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE')
     )
-    op.create_index(op.f('ix_provider_configurations_id'), 'provider_configurations', ['id'], unique=False)
-    op.create_index(op.f('ix_provider_configurations_provider_name'), 'provider_configurations', ['provider_name'], unique=False)
-    op.create_index(op.f('ix_provider_configurations_provider_type'), 'provider_configurations', ['provider_type'], unique=False)
-
-    # Create usage_records table
-    op.create_table('usage_records',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('call_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('campaign_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('metric_type', sa.String(50), nullable=False),
-        sa.Column('provider', sa.String(50), nullable=True),
-        sa.Column('quantity', sa.Integer(), nullable=False),
-        sa.Column('unit', sa.String(20), nullable=False),
-        sa.Column('estimated_cost', sa.Numeric(10, 4), nullable=True),
-        sa.Column('currency', sa.String(3), default='USD'),
-        sa.Column('recorded_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.ForeignKeyConstraint(['call_id'], ['calls.id'], ondelete='SET NULL'),
-        sa.ForeignKeyConstraint(['campaign_id'], ['campaigns.id'], ondelete='SET NULL')
-    )
-    op.create_index(op.f('ix_usage_records_campaign_id'), 'usage_records', ['campaign_id'], unique=False)
-    op.create_index(op.f('ix_usage_records_call_id'), 'usage_records', ['call_id'], unique=False)
-    op.create_index(op.f('ix_usage_records_id'), 'usage_records', ['id'], unique=False)
-    op.create_index(op.f('ix_usage_records_metric_type'), 'usage_records', ['metric_type'], unique=False)
-    op.create_index(op.f('ix_usage_records_recorded_at'), 'usage_records', ['recorded_at'], unique=False)
-
-    # Create audit_logs table
-    op.create_table('audit_logs',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('action', sa.String(100), nullable=False),
-        sa.Column('entity_type', sa.String(50), nullable=False),
-        sa.Column('entity_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('description', sa.Text(), nullable=True),
-        sa.Column('changes', sa.JSON(), nullable=True),
-        sa.Column('ip_address', sa.String(45), nullable=True),
-        sa.Column('user_agent', sa.String(500), nullable=True),
-        sa.Column('success', sa.String(20), default='true'),
-        sa.Column('error_message', sa.Text(), nullable=True),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='SET NULL')
-    )
-    op.create_index(op.f('ix_audit_logs_action'), 'audit_logs', ['action'], unique=False)
-    op.create_index(op.f('ix_audit_logs_created_at'), 'audit_logs', ['created_at'], unique=False)
-    op.create_index(op.f('ix_audit_logs_entity_id'), 'audit_logs', ['entity_id'], unique=False)
-    op.create_index(op.f('ix_audit_logs_entity_type'), 'audit_logs', ['entity_type'], unique=False)
-    op.create_index(op.f('ix_audit_logs_id'), 'audit_logs', ['id'], unique=False)
-    op.create_index(op.f('ix_audit_logs_user_id'), 'audit_logs', ['user_id'], unique=False)
+    op.create_index(op.f('ix_company_profiles_id'), 'company_profiles', ['id'], unique=False)
+    op.create_index(op.f('ix_company_profiles_user_id'), 'company_profiles', ['user_id'], unique=True)
 
 
 def downgrade():
-    op.drop_index(op.f('ix_audit_logs_user_id'), table_name='audit_logs')
-    op.drop_index(op.f('ix_audit_logs_id'), table_name='audit_logs')
-    op.drop_index(op.f('ix_audit_logs_entity_type'), table_name='audit_logs')
-    op.drop_index(op.f('ix_audit_logs_entity_id'), table_name='audit_logs')
-    op.drop_index(op.f('ix_audit_logs_created_at'), table_name='audit_logs')
-    op.drop_index(op.f('ix_audit_logs_action'), table_name='audit_logs')
-    op.drop_table('audit_logs')
-
-    op.drop_index(op.f('ix_usage_records_recorded_at'), table_name='usage_records')
-    op.drop_index(op.f('ix_usage_records_metric_type'), table_name='usage_records')
-    op.drop_index(op.f('ix_usage_records_id'), table_name='usage_records')
-    op.drop_index(op.f('ix_usage_records_call_id'), table_name='usage_records')
-    op.drop_index(op.f('ix_usage_records_campaign_id'), table_name='usage_records')
-    op.drop_table('usage_records')
-
-    op.drop_index(op.f('ix_provider_configurations_provider_type'), table_name='provider_configurations')
-    op.drop_index(op.f('ix_provider_configurations_provider_name'), table_name='provider_configurations')
-    op.drop_index(op.f('ix_provider_configurations_id'), table_name='provider_configurations')
-    op.drop_table('provider_configurations')
+    op.drop_index(op.f('ix_company_profiles_user_id'), table_name='company_profiles')
+    op.drop_index(op.f('ix_company_profiles_id'), table_name='company_profiles')
+    op.drop_table('company_profiles')
 
     op.drop_index(op.f('ix_extracted_call_results_id'), table_name='extracted_call_results')
     op.drop_index(op.f('ix_extracted_call_results_call_id'), table_name='extracted_call_results')
@@ -288,12 +218,6 @@ def downgrade():
     op.drop_index(op.f('ix_transcripts_id'), table_name='transcripts')
     op.drop_index(op.f('ix_transcripts_call_id'), table_name='transcripts')
     op.drop_table('transcripts')
-
-    op.drop_index(op.f('ix_call_events_timestamp'), table_name='call_events')
-    op.drop_index(op.f('ix_call_events_id'), table_name='call_events')
-    op.drop_index(op.f('ix_call_events_event_type'), table_name='call_events')
-    op.drop_index(op.f('ix_call_events_call_id'), table_name='call_events')
-    op.drop_table('call_events')
 
     op.drop_index(op.f('ix_calls_status'), table_name='calls')
     op.drop_index(op.f('ix_calls_provider_call_id'), table_name='calls')

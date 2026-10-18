@@ -31,7 +31,7 @@ class Call(Base):
     
     # Provider information
     provider_call_id = Column(String(255), nullable=True, index=True)  # External provider's call ID
-    provider = Column(String(50), nullable=True)  # e.g., "twilio"
+    provider = Column(String(50), nullable=True)  # e.g., "openwa"
     
     # Call details
     phone_number = Column(String(20), nullable=False)

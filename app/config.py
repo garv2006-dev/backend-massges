@@ -24,13 +24,12 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     DEEPGRAM_API_KEY: Optional[str] = None
     
-    # Telephony Provider (Twilio)
-    TWILIO_ACCOUNT_SID: Optional[str] = None
-    TWILIO_AUTH_TOKEN: Optional[str] = None
-    TWILIO_PHONE_NUMBER: Optional[str] = None
-    TWILIO_API_KEY: Optional[str] = None
-    TWILIO_API_SECRET: Optional[str] = None
-    PUBLIC_WEBHOOK_URL: Optional[str] = None  # e.g., "https://abc123.ngrok-free.app"
+    # WhatsApp Telephony Gateway (OpenWA)
+    OPENWA_BASE_URL: str = "http://localhost:2785"
+    OPENWA_API_KEY: Optional[str] = None
+    OPENWA_SESSION_ID: str = "default"
+    OPENWA_WEBHOOK_SECRET: Optional[str] = None
+    PUBLIC_WEBHOOK_URL: Optional[str] = None  # e.g., Cloudflare tunnel or ngrok webhook URL
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
