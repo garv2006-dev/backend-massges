@@ -190,20 +190,17 @@ class ExcelService:
             Excel file content as bytes
         """
         from sqlalchemy import select
+        from sqlalchemy import select
         from app.models.campaign_contact import CampaignContact
         from app.models.contact import Contact
-        from app.models.call import Call
-        from app.models.transcript import Transcript
-        from app.models.extracted_call_result import ExtractedCallResult
+        from app.models.whatsapp_conversation import WhatsAppConversation
         
         # Get campaign contacts with related data
         query = (
-            select(CampaignContact, Contact, Call, Transcript, ExtractedCallResult)
+            select(CampaignContact, Contact)
             .join(Contact, CampaignContact.contact_id == Contact.id)
-            .outerjoin(Call, CampaignContact.id == Call.campaign_contact_id)
-            .outerjoin(Transcript, Call.id == Transcript.call_id)
-            .outerjoin(ExtractedCallResult, Call.id == ExtractedCallResult.call_id)
             .where(CampaignContact.campaign_id == campaign_id)
+            .order_by(CampaignContact.created_at.asc())
         )
         
         result = await self.db.execute(query)
@@ -211,38 +208,19 @@ class ExcelService:
         
         # Prepare data for export
         export_data = []
-        for cc, contact, call, transcript, extracted in rows:
+        for cc, contact in rows:
             row = {
                 "Contact ID": str(contact.id),
                 "Name": contact.name or "",
                 "Phone Number": contact.phone_number,
                 "Email": contact.email or "",
-                "Language": contact.language,
-                "Campaign Contact Status": cc.status.value if hasattr(cc.status, "value") else str(cc.status or ""),
+                "Language": contact.language or "en",
+                "WhatsApp Delivery Status": cc.status.value if hasattr(cc.status, "value") else str(cc.status or "completed"),
                 "Retry Count": cc.retry_count or 0,
+                "Dispatched At": cc.started_at.isoformat() if cc.started_at else "",
+                "Delivered At": cc.completed_at.isoformat() if cc.completed_at else "",
                 "Last Error": cc.last_error or "",
-                "Call ID": str(call.id) if call else "",
-                "Call Status": (call.status.value if hasattr(call.status, "value") else str(call.status)) if call else "",
-                "Call Duration (seconds)": call.duration_seconds if call else "",
-                "Call Started": call.started_at.isoformat() if call and call.started_at else "",
-                "Call Ended": call.ended_at.isoformat() if call and call.ended_at else "",
-                "Failure Reason": call.failure_reason or "" if call else "",
-                "AI Interactions": call.ai_interactions if call else 0,
             }
-            
-            if include_transcripts and transcript:
-                row["Transcript"] = transcript.full_transcript or ""
-                row["Word Count"] = transcript.word_count
-            
-            if extracted:
-                row["Customer Name"] = extracted.customer_name or ""
-                row["Customer Intent"] = extracted.customer_intent or ""
-                row["Customer Rating"] = extracted.customer_rating or ""
-                row["Complaint"] = extracted.complaint or ""
-                row["Follow Up Required"] = extracted.follow_up_required or ""
-                row["Follow Up Notes"] = extracted.follow_up_notes or ""
-                row["Call Outcome"] = extracted.call_outcome or ""
-            
             export_data.append(row)
         
         # Create DataFrame

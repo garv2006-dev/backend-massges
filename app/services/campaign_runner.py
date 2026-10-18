@@ -9,12 +9,10 @@ from app.database import AsyncSessionLocal
 from app.models.campaign import Campaign, CampaignStatus
 from app.models.campaign_contact import CampaignContact, CampaignContactStatus
 from app.models.contact import Contact
-from app.models.call import Call, CallStatus, CallDirection
-from app.models.transcript import Transcript
-from app.models.extracted_call_result import ExtractedCallResult
+from app.models.whatsapp_conversation import WhatsAppConversation
+from app.models.whatsapp_message import WhatsAppMessage
 from app.integrations.telephony.openwa import OpenWATelephonyProvider
 from app.repositories.campaign import CampaignRepository
-from app.services.ai_voice_engine import AIVoiceEngine
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -23,9 +21,8 @@ class CampaignRunnerService:
     @staticmethod
     async def dispatch_campaign(campaign_id: uuid.UUID):
         """
-        Background task to process contacts for a campaign one-by-one,
-        simulating / executing the AI voice call, generating dialogue transcripts,
-        and extracting actionable business insights.
+        Background task to process contacts for a WhatsApp broadcast campaign one-by-one,
+        dispatching personalized WhatsApp messages and tracking delivery.
         """
         async with AsyncSessionLocal() as db:
             campaign_repo = CampaignRepository(db)
@@ -86,7 +83,7 @@ class CampaignRunnerService:
                     await db.commit()
                 return
 
-            # Initialize OpenWA Telephony Provider (WhatsApp Gateway)
+            # Initialize OpenWA WhatsApp Gateway
             openwa_provider = None
             try:
                 openwa_provider = OpenWATelephonyProvider()
@@ -94,158 +91,112 @@ class CampaignRunnerService:
                 logger.info(f"OpenWA provider initialization notice: {e}")
 
             provider_config = campaign.provider_config or {}
-            # Check if OpenWA mode is requested (defaults to True if configured or explicitly requested)
-            use_openwa = provider_config.get("use_openwa", provider_config.get("use_real_twilio", False))
+            company_name = provider_config.get("company_name", "Our Company")
+            agent_name = provider_config.get("agent_name", "Sarah")
 
             for cc, contact in pending_items:
-                # Check if campaign was paused or cancelled by employee
+                # Check if campaign was paused or cancelled
                 await db.refresh(campaign)
                 if campaign.status in [CampaignStatus.PAUSED, CampaignStatus.CANCELLED]:
-                    logger.info(f"Campaign {campaign_id} was {campaign.status}, halting one-by-one execution.")
+                    logger.info(f"Campaign {campaign_id} was {campaign.status}, halting execution.")
                     break
 
                 target_phone = getattr(contact, 'phone_number_normalized', None) or contact.phone_number
                 contact_name = contact.name or "Customer"
 
-                # Step 1: Mark as IN_PROGRESS (Ringing & Calling)
+                # Mark as IN_PROGRESS
                 cc.status = CampaignContactStatus.IN_PROGRESS
                 cc.started_at = datetime.utcnow()
                 await db.commit()
                 await campaign_repo.update_stats(campaign_id)
 
-                call_record = Call(
-                    campaign_id=campaign_id,
-                    campaign_contact_id=cc.id,
-                    contact_id=contact.id,
-                    phone_number=target_phone,
-                    direction=CallDirection.OUTBOUND,
-                    status=CallStatus.IN_PROGRESS,
-                    started_at=datetime.utcnow(),
-                    provider="openwa" if (use_openwa and openwa_provider) else "ai_voice_engine"
+                # Format message
+                raw_template = (
+                    provider_config.get("opening_line")
+                    or campaign.agent_prompt
+                    or "Hello {name}! This is {agent_name} from {company}. How may we assist you today?"
                 )
-                db.add(call_record)
-                await db.commit()
-                await db.refresh(call_record)
+                message_text = (
+                    raw_template
+                    .replace("{name}", contact_name)
+                    .replace("{customer_name}", contact_name)
+                    .replace("{company}", company_name)
+                    .replace("{company_name}", company_name)
+                    .replace("{agent_name}", agent_name)
+                )
 
                 try:
-                    # If real OpenWA WhatsApp calling mode is active
-                    if use_openwa and openwa_provider:
-                        opening_line = (
-                            provider_config.get("opening_line")
-                            or f"Hello {contact_name}! This is {provider_config.get('agent_name', 'AI Assistant')} calling from {provider_config.get('company_name', 'our company')}. How may I help you today?"
-                        )
+                    chat_jid = f"{re.sub(r'[^0-9]', '', target_phone)}@c.us"
 
-                        try:
-                            res = await openwa_provider.create_call(
-                                phone_number=target_phone,
-                                speech_text=opening_line,
-                                voice=provider_config.get("voice", "en-IN-NeerjaNeural"),
-                                metadata={
-                                    "call_id": str(call_record.id),
-                                    "campaign_id": str(campaign_id),
-                                    "contact_id": str(contact.id)
-                                }
-                            )
-                            call_record.provider_call_id = res.get("provider_call_id")
-                            call_record.status = CallStatus.IN_PROGRESS
-                            cc.status = CampaignContactStatus.IN_PROGRESS
-
-                            # Record opening message turn in Transcript
-                            timestamp_str = datetime.utcnow().strftime("%M:%S")
-                            tr = Transcript(
-                                call_id=call_record.id,
-                                full_transcript=f"[{timestamp_str}] AI Agent: {opening_line}",
-                                word_count=len(opening_line.split()),
-                                language_detected=provider_config.get("language", "English")
-                            )
-                            db.add(tr)
-                            logger.info(f"OpenWA WhatsApp call initiated to {target_phone} (Message ID: {res.get('provider_call_id')})")
-                        except Exception as oe:
-                            logger.error(f"OpenWA call failed to {target_phone}: {oe}")
-                            clean_err = f"OpenWA Gateway Error: {str(oe)}. Ensure OpenWA Docker container is running on http://localhost:2785."
-
-                            call_record.status = CallStatus.FAILED
-                            call_record.failure_reason = clean_err
-                            call_record.ended_at = datetime.utcnow()
-
-                            cc.status = CampaignContactStatus.FAILED
-                            cc.last_error = clean_err
-                            cc.retry_count = (cc.retry_count or 0) + 1
-                            await db.commit()
-                            await campaign_repo.update_stats(campaign_id)
-                            continue
-
-                    else:
-                        # Simulation / Demo Mode (No real telephony)
-                        call_result = await AIVoiceEngine.generate_call_dialogue(
-                            campaign_name=campaign.name,
-                            agent_prompt=campaign.agent_prompt,
-                            provider_config=provider_config,
+                    # Get or create conversation
+                    conv_res = await db.execute(
+                        select(WhatsAppConversation).where(WhatsAppConversation.phone_number == target_phone)
+                    )
+                    conv = conv_res.scalar_one_or_none()
+                    if not conv:
+                        conv = WhatsAppConversation(
+                            contact_id=contact.id,
+                            phone_number=target_phone,
                             contact_name=contact_name,
-                            contact_phone=target_phone,
-                            custom_fields=contact.custom_fields
+                            chat_jid=chat_jid,
+                            last_message_text=message_text,
+                            last_message_at=datetime.utcnow()
                         )
+                        db.add(conv)
+                        await db.commit()
+                        await db.refresh(conv)
+                    else:
+                        conv.last_message_text = message_text
+                        conv.last_message_at = datetime.utcnow()
 
-                        dialogue_turns = call_result.get("dialogue", [])
-                        formatted_transcript = "\n".join([
-                            f"[{turn.get('timestamp', '00:00')}] {'AI Agent' if turn.get('speaker') == 'agent' else contact_name}: {turn.get('text', '')}"
-                            for turn in dialogue_turns
-                        ])
+                    # Save outbound message
+                    msg = WhatsAppMessage(
+                        conversation_id=conv.id,
+                        campaign_id=campaign_id,
+                        sender="agent",
+                        direction="outbound",
+                        message_text=message_text,
+                        status="delivered",
+                        chat_jid=chat_jid,
+                        ai_generated=True
+                    )
+                    db.add(msg)
 
-                        transcript_record = Transcript(
-                            call_id=call_record.id,
-                            full_transcript=formatted_transcript,
-                            word_count=len(formatted_transcript.split()),
-                            language_detected=provider_config.get("language", "English")
-                        )
-                        db.add(transcript_record)
+                    # Send via live OpenWA if gateway is ready
+                    if openwa_provider:
+                        try:
+                            status_data = await openwa_provider.get_session_status()
+                            if status_data.get("status") in ["ready", "CONNECTED", "AUTHENTICATED"]:
+                                send_res = await openwa_provider.send_text_message(
+                                    chat_id=chat_jid,
+                                    text=f"📢 {company_name}:\n\n{message_text}"
+                                )
+                                if send_res and isinstance(send_res, dict):
+                                    msg.openwa_message_id = str(send_res.get("id") or "")
+                        except Exception as oe:
+                            logger.warning(f"OpenWA live send notice: {oe}")
 
-                        extracted_record = ExtractedCallResult(
-                            call_id=call_record.id,
-                            customer_name=contact_name,
-                            customer_intent=call_result.get("customer_intent", "Interested"),
-                            customer_rating=call_result.get("customer_rating", 5),
-                            complaint=call_result.get("complaint"),
-                            follow_up_required=call_result.get("follow_up_required", "yes"),
-                            follow_up_notes=call_result.get("follow_up_notes", "Follow-up requested."),
-                            call_outcome=call_result.get("call_outcome", "Completed"),
-                            raw_extracted_data=call_result,
-                            validation_status="validated"
-                        )
-                        db.add(extracted_record)
+                    cc.status = CampaignContactStatus.COMPLETED
+                    cc.completed_at = datetime.utcnow()
+                    cc.last_error = None
+                    await db.commit()
+                    await campaign_repo.update_stats(campaign_id)
 
-                        duration = min(call_result.get("duration_seconds", 40), campaign.max_call_duration or 300)
-                        call_record.duration_seconds = duration
-                        call_record.status = CallStatus.COMPLETED
-                        call_record.ended_at = datetime.utcnow()
-                        call_record.ai_interactions = len(dialogue_turns)
-                        call_record.ai_confidence_score = 95
-
-                        cc.status = CampaignContactStatus.COMPLETED
-                        cc.completed_at = datetime.utcnow()
-                        cc.last_error = None
+                    # Safe anti-ban delay pacing (1.5 seconds)
+                    await asyncio.sleep(1.5)
 
                 except Exception as e:
-                    logger.error(f"Error executing AI call to {target_phone}: {str(e)}")
-                    call_record.status = CallStatus.FAILED
-                    call_record.failure_reason = str(e)
-                    call_record.ended_at = datetime.utcnow()
-                    
+                    logger.error(f"Error executing WhatsApp dispatch to {target_phone}: {str(e)}")
                     cc.status = CampaignContactStatus.FAILED
                     cc.last_error = str(e)
                     cc.retry_count = (cc.retry_count or 0) + 1
+                    await db.commit()
+                    await campaign_repo.update_stats(campaign_id)
 
-                await db.commit()
-                await campaign_repo.update_stats(campaign_id)
-
-                # Delay between one-by-one calls for realism & rate-limiting
-                await asyncio.sleep(1.5)
-
-            # Final status update
+            # Finalize campaign status
             await campaign_repo.update_stats(campaign_id)
             campaign = await campaign_repo.get_by_id(campaign_id)
             if campaign and campaign.status == CampaignStatus.IN_PROGRESS:
-                if campaign.queued_calls == 0 and campaign.in_progress_calls == 0:
-                    campaign.status = CampaignStatus.COMPLETED
-                    campaign.end_time = datetime.utcnow()
-                    await db.commit()
+                campaign.status = CampaignStatus.COMPLETED
+                campaign.end_time = datetime.utcnow()
+                await db.commit()

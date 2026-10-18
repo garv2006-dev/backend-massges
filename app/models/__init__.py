@@ -3,10 +3,9 @@ from app.models.contact import Contact
 from app.models.contact_import import ContactImport
 from app.models.campaign import Campaign
 from app.models.campaign_contact import CampaignContact
-from app.models.call import Call
-from app.models.transcript import Transcript
-from app.models.extracted_call_result import ExtractedCallResult
 from app.models.company_profile import CompanyProfile
+from app.models.whatsapp_conversation import WhatsAppConversation
+from app.models.whatsapp_message import WhatsAppMessage
 
 __all__ = [
     "User",
@@ -15,7 +14,6 @@ __all__ = [
     "ContactImport",
     "Campaign",
     "CampaignContact",
-    "Call",
-    "Transcript",
-    "ExtractedCallResult",
+    "WhatsAppConversation",
+    "WhatsAppMessage",
 ]

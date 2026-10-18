@@ -1,4 +1,4 @@
-"""Initial database schema
+"""Initial database schema for WhatsApp Automation and AI Messaging Platform
 
 Revision ID: 001
 Revises: 
@@ -17,7 +17,7 @@ depends_on = None
 
 
 def upgrade():
-    # Create users table
+    # 1. Create users table
     op.create_table('users',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column('email', sa.String(255), nullable=False, unique=True),
@@ -31,27 +31,28 @@ def upgrade():
     op.create_index(op.f('ix_users_email'), 'users', ['email'], unique=True)
     op.create_index(op.f('ix_users_id'), 'users', ['id'], unique=False)
 
-    # Create contacts table
-    op.create_table('contacts',
+    # 2. Create company_profiles table
+    op.create_table('company_profiles',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('import_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('phone_number', sa.String(20), nullable=False),
-        sa.Column('phone_number_normalized', sa.String(20), nullable=False, unique=True),
-        sa.Column('name', sa.String(255)),
-        sa.Column('email', sa.String(255)),
-        sa.Column('language', sa.String(10), default='en'),
-        sa.Column('custom_fields', sa.JSON(), nullable=True),
-        sa.Column('validation_status', sa.String(20), default='valid'),
-        sa.Column('validation_error', sa.Text(), nullable=True),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True, unique=True),
+        sa.Column('name', sa.String(255), nullable=False, server_default=''),
+        sa.Column('phone_number', sa.String(50), nullable=False, server_default=''),
+        sa.Column('email', sa.String(255), nullable=True),
+        sa.Column('industry', sa.String(255), server_default='Customer Service & Sales Automation', nullable=True),
+        sa.Column('website', sa.String(255), nullable=True),
+        sa.Column('default_agent_name', sa.String(100), server_default='Sarah', nullable=True),
+        sa.Column('default_voice', sa.String(100), server_default='en-IN-NeerjaNeural', nullable=True),
+        sa.Column('default_language', sa.String(100), server_default='English', nullable=True),
+        sa.Column('simulated_connected', sa.Boolean(), server_default='false', nullable=False),
+        sa.Column('whatsapp_phone', sa.String(50), server_default='', nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()'))
+        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()')),
+        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE')
     )
-    op.create_index(op.f('ix_contacts_id'), 'contacts', ['id'], unique=False)
-    op.create_index(op.f('ix_contacts_import_id'), 'contacts', ['import_id'], unique=False)
-    op.create_index(op.f('ix_contacts_phone_number'), 'contacts', ['phone_number'], unique=False)
-    op.create_index(op.f('ix_contacts_phone_number_normalized'), 'contacts', ['phone_number_normalized'], unique=True)
+    op.create_index(op.f('ix_company_profiles_id'), 'company_profiles', ['id'], unique=False)
+    op.create_index(op.f('ix_company_profiles_user_id'), 'company_profiles', ['user_id'], unique=True)
 
-    # Create contact_imports table
+    # 3. Create contact_imports table
     op.create_table('contact_imports',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column('file_name', sa.String(255), nullable=False),
@@ -69,7 +70,28 @@ def upgrade():
     )
     op.create_index(op.f('ix_contact_imports_id'), 'contact_imports', ['id'], unique=False)
 
-    # Create campaigns table
+    # 4. Create contacts table
+    op.create_table('contacts',
+        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column('import_id', postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column('phone_number', sa.String(20), nullable=False),
+        sa.Column('phone_number_normalized', sa.String(20), nullable=False, unique=True),
+        sa.Column('name', sa.String(255)),
+        sa.Column('email', sa.String(255)),
+        sa.Column('language', sa.String(10), default='en'),
+        sa.Column('custom_fields', sa.JSON(), nullable=True),
+        sa.Column('validation_status', sa.String(20), default='valid'),
+        sa.Column('validation_error', sa.Text(), nullable=True),
+        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()')),
+        sa.ForeignKeyConstraint(['import_id'], ['contact_imports.id'], ondelete='SET NULL')
+    )
+    op.create_index(op.f('ix_contacts_id'), 'contacts', ['id'], unique=False)
+    op.create_index(op.f('ix_contacts_import_id'), 'contacts', ['import_id'], unique=False)
+    op.create_index(op.f('ix_contacts_phone_number'), 'contacts', ['phone_number'], unique=False)
+    op.create_index(op.f('ix_contacts_phone_number_normalized'), 'contacts', ['phone_number_normalized'], unique=True)
+
+    # 5. Create campaigns table
     op.create_table('campaigns',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column('name', sa.String(255), nullable=False),
@@ -96,7 +118,7 @@ def upgrade():
     op.create_index(op.f('ix_campaigns_id'), 'campaigns', ['id'], unique=False)
     op.create_index(op.f('ix_campaigns_status'), 'campaigns', ['status'], unique=False)
 
-    # Create campaign_contacts table
+    # 6. Create campaign_contacts table
     op.create_table('campaign_contacts',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column('campaign_id', postgresql.UUID(as_uuid=True), nullable=False),
@@ -117,115 +139,59 @@ def upgrade():
     op.create_index(op.f('ix_campaign_contacts_id'), 'campaign_contacts', ['id'], unique=False)
     op.create_index(op.f('ix_campaign_contacts_status'), 'campaign_contacts', ['status'], unique=False)
 
-    # Create calls table
-    op.create_table('calls',
+    # 7. Create whatsapp_conversations table
+    op.create_table('whatsapp_conversations',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('campaign_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('campaign_contact_id', postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column('contact_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('provider_call_id', sa.String(255), nullable=True),
-        sa.Column('provider', sa.String(50), nullable=True),
-        sa.Column('phone_number', sa.String(20), nullable=False),
-        sa.Column('direction', sa.Enum('outbound', 'inbound', name='calldirection'), nullable=False, default='outbound'),
-        sa.Column('status', sa.Enum('queued', 'ringing', 'in_progress', 'completed', 'failed', 'no_answer', 'busy', 'cancelled', 'rejected', name='callstatus'), nullable=False, default='queued'),
-        sa.Column('queued_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('started_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('ended_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('duration_seconds', sa.Integer(), nullable=True),
-        sa.Column('failure_reason', sa.Text(), nullable=True),
-        sa.Column('hangup_cause', sa.String(100), nullable=True),
-        sa.Column('ai_interactions', sa.Integer(), default=0),
-        sa.Column('ai_confidence_score', sa.Integer(), nullable=True),
+        sa.Column('phone_number', sa.String(50), nullable=False),
+        sa.Column('contact_name', sa.String(255), nullable=True),
+        sa.Column('chat_jid', sa.String(100), nullable=True),
+        sa.Column('last_message_text', sa.Text(), nullable=True),
+        sa.Column('last_message_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column('unread_count', sa.Integer(), server_default='0', nullable=False),
+        sa.Column('is_pinned', sa.Boolean(), server_default='false', nullable=False),
+        sa.Column('is_archived', sa.Boolean(), server_default='false', nullable=False),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
         sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()')),
-        sa.ForeignKeyConstraint(['campaign_contact_id'], ['campaign_contacts.id'], ondelete='SET NULL'),
-        sa.ForeignKeyConstraint(['campaign_id'], ['campaigns.id'], ondelete='SET NULL'),
+        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='SET NULL'),
         sa.ForeignKeyConstraint(['contact_id'], ['contacts.id'], ondelete='SET NULL')
     )
-    op.create_index(op.f('ix_calls_campaign_contact_id'), 'calls', ['campaign_contact_id'], unique=False)
-    op.create_index(op.f('ix_calls_campaign_id'), 'calls', ['campaign_id'], unique=False)
-    op.create_index(op.f('ix_calls_contact_id'), 'calls', ['contact_id'], unique=False)
-    op.create_index(op.f('ix_calls_id'), 'calls', ['id'], unique=False)
-    op.create_index(op.f('ix_calls_provider_call_id'), 'calls', ['provider_call_id'], unique=False)
-    op.create_index(op.f('ix_calls_status'), 'calls', ['status'], unique=False)
+    op.create_index(op.f('ix_whatsapp_conversations_id'), 'whatsapp_conversations', ['id'], unique=False)
+    op.create_index(op.f('ix_whatsapp_conversations_phone_number'), 'whatsapp_conversations', ['phone_number'], unique=False)
+    op.create_index(op.f('ix_whatsapp_conversations_chat_jid'), 'whatsapp_conversations', ['chat_jid'], unique=False)
 
-    # Create transcripts table
-    op.create_table('transcripts',
+    # 8. Create whatsapp_messages table
+    op.create_table('whatsapp_messages',
         sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('call_id', postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column('full_transcript', sa.Text(), nullable=True),
-        sa.Column('word_count', sa.Integer(), default=0),
-        sa.Column('language_detected', sa.String(10), nullable=True),
+        sa.Column('conversation_id', postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column('campaign_id', postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column('sender', sa.String(50), server_default='agent', nullable=False),
+        sa.Column('direction', sa.String(20), server_default='outbound', nullable=False),
+        sa.Column('message_text', sa.Text(), nullable=False),
+        sa.Column('status', sa.String(30), server_default='sent', nullable=True),
+        sa.Column('openwa_message_id', sa.String(255), nullable=True),
+        sa.Column('chat_jid', sa.String(100), nullable=True),
+        sa.Column('ai_generated', sa.Boolean(), server_default='false', nullable=False),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()')),
-        sa.ForeignKeyConstraint(['call_id'], ['calls.id'], ondelete='CASCADE')
+        sa.ForeignKeyConstraint(['conversation_id'], ['whatsapp_conversations.id'], ondelete='CASCADE'),
+        sa.ForeignKeyConstraint(['campaign_id'], ['campaigns.id'], ondelete='SET NULL')
     )
-    op.create_index(op.f('ix_transcripts_call_id'), 'transcripts', ['call_id'], unique=True)
-    op.create_index(op.f('ix_transcripts_id'), 'transcripts', ['id'], unique=False)
-
-    # Create extracted_call_results table
-    op.create_table('extracted_call_results',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('call_id', postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column('customer_name', sa.String(255), nullable=True),
-        sa.Column('customer_intent', sa.String(255), nullable=True),
-        sa.Column('customer_rating', sa.Integer(), nullable=True),
-        sa.Column('complaint', sa.Text(), nullable=True),
-        sa.Column('follow_up_required', sa.String(20), nullable=True),
-        sa.Column('follow_up_notes', sa.Text(), nullable=True),
-        sa.Column('call_outcome', sa.String(100), nullable=True),
-        sa.Column('raw_extracted_data', sa.JSON(), nullable=True),
-        sa.Column('validation_status', sa.String(20), default='pending'),
-        sa.Column('validation_errors', sa.Text(), nullable=True),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()')),
-        sa.ForeignKeyConstraint(['call_id'], ['calls.id'], ondelete='CASCADE')
-    )
-    op.create_index(op.f('ix_extracted_call_results_call_id'), 'extracted_call_results', ['call_id'], unique=True)
-    op.create_index(op.f('ix_extracted_call_results_id'), 'extracted_call_results', ['id'], unique=False)
-
-    # Create company_profiles table
-    op.create_table('company_profiles',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=True, unique=True),
-        sa.Column('name', sa.String(255), nullable=False, server_default=''),
-        sa.Column('phone_number', sa.String(50), nullable=False, server_default=''),
-        sa.Column('email', sa.String(255), nullable=True),
-        sa.Column('industry', sa.String(255), server_default='Customer Service & Sales Automation', nullable=True),
-        sa.Column('website', sa.String(255), nullable=True),
-        sa.Column('default_agent_name', sa.String(100), server_default='Sarah', nullable=True),
-        sa.Column('default_voice', sa.String(100), server_default='en-IN-NeerjaNeural', nullable=True),
-        sa.Column('default_language', sa.String(100), server_default='English', nullable=True),
-        sa.Column('simulated_connected', sa.Boolean(), server_default='false', nullable=False),
-        sa.Column('whatsapp_phone', sa.String(50), server_default='', nullable=True),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), onupdate=sa.text('now()')),
-        sa.ForeignKeyConstraint(['user_id'], ['users.id'], ondelete='CASCADE')
-    )
-    op.create_index(op.f('ix_company_profiles_id'), 'company_profiles', ['id'], unique=False)
-    op.create_index(op.f('ix_company_profiles_user_id'), 'company_profiles', ['user_id'], unique=True)
+    op.create_index(op.f('ix_whatsapp_messages_id'), 'whatsapp_messages', ['id'], unique=False)
+    op.create_index(op.f('ix_whatsapp_messages_conversation_id'), 'whatsapp_messages', ['conversation_id'], unique=False)
+    op.create_index(op.f('ix_whatsapp_messages_campaign_id'), 'whatsapp_messages', ['campaign_id'], unique=False)
 
 
 def downgrade():
-    op.drop_index(op.f('ix_company_profiles_user_id'), table_name='company_profiles')
-    op.drop_index(op.f('ix_company_profiles_id'), table_name='company_profiles')
-    op.drop_table('company_profiles')
+    op.drop_index(op.f('ix_whatsapp_messages_campaign_id'), table_name='whatsapp_messages')
+    op.drop_index(op.f('ix_whatsapp_messages_conversation_id'), table_name='whatsapp_messages')
+    op.drop_index(op.f('ix_whatsapp_messages_id'), table_name='whatsapp_messages')
+    op.drop_table('whatsapp_messages')
 
-    op.drop_index(op.f('ix_extracted_call_results_id'), table_name='extracted_call_results')
-    op.drop_index(op.f('ix_extracted_call_results_call_id'), table_name='extracted_call_results')
-    op.drop_table('extracted_call_results')
-
-    op.drop_index(op.f('ix_transcripts_id'), table_name='transcripts')
-    op.drop_index(op.f('ix_transcripts_call_id'), table_name='transcripts')
-    op.drop_table('transcripts')
-
-    op.drop_index(op.f('ix_calls_status'), table_name='calls')
-    op.drop_index(op.f('ix_calls_provider_call_id'), table_name='calls')
-    op.drop_index(op.f('ix_calls_id'), table_name='calls')
-    op.drop_index(op.f('ix_calls_contact_id'), table_name='calls')
-    op.drop_index(op.f('ix_calls_campaign_id'), table_name='calls')
-    op.drop_index(op.f('ix_calls_campaign_contact_id'), table_name='calls')
-    op.drop_table('calls')
+    op.drop_index(op.f('ix_whatsapp_conversations_chat_jid'), table_name='whatsapp_conversations')
+    op.drop_index(op.f('ix_whatsapp_conversations_phone_number'), table_name='whatsapp_conversations')
+    op.drop_index(op.f('ix_whatsapp_conversations_id'), table_name='whatsapp_conversations')
+    op.drop_table('whatsapp_conversations')
 
     op.drop_index(op.f('ix_campaign_contacts_status'), table_name='campaign_contacts')
     op.drop_index(op.f('ix_campaign_contacts_id'), table_name='campaign_contacts')
@@ -237,14 +203,18 @@ def downgrade():
     op.drop_index(op.f('ix_campaigns_id'), table_name='campaigns')
     op.drop_table('campaigns')
 
-    op.drop_index(op.f('ix_contact_imports_id'), table_name='contact_imports')
-    op.drop_table('contact_imports')
-
     op.drop_index(op.f('ix_contacts_phone_number_normalized'), table_name='contacts')
     op.drop_index(op.f('ix_contacts_phone_number'), table_name='contacts')
     op.drop_index(op.f('ix_contacts_import_id'), table_name='contacts')
     op.drop_index(op.f('ix_contacts_id'), table_name='contacts')
     op.drop_table('contacts')
+
+    op.drop_index(op.f('ix_contact_imports_id'), table_name='contact_imports')
+    op.drop_table('contact_imports')
+
+    op.drop_index(op.f('ix_company_profiles_user_id'), table_name='company_profiles')
+    op.drop_index(op.f('ix_company_profiles_id'), table_name='company_profiles')
+    op.drop_table('company_profiles')
 
     op.drop_index(op.f('ix_users_id'), table_name='users')
     op.drop_index(op.f('ix_users_email'), table_name='users')

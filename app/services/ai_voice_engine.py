@@ -201,7 +201,7 @@ Also analyze the conversation and return ONLY a valid JSON object formatted as:
         if genai and settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
             try:
                 system_prompt = f"""
-You are {agent_name}, an AI calling representative at {company_name}.
+You are {agent_name}, representing {company_name} on WhatsApp.
 Tone: {tone}
 Language: {language}
 Goal & Guidelines:
@@ -209,13 +209,13 @@ Goal & Guidelines:
 
 Customer Name: {contact_name}
 
-Respond in 1-2 spoken sentences naturally as if speaking on the phone. Do not use bullet points or markdown formatting. Keep it conversational and warm.
+Respond in 1-2 natural, polite, and helpful sentences as a human customer support or relationship manager chatting on WhatsApp. Keep it concise, friendly, and human-like. Do not use phone call terms or robotic phrasing.
 """
                 client = genai.Client(api_key=settings.GEMINI_API_KEY)
                 
                 # Build chat history
                 history_text = "\n".join([f"{turn.get('speaker', 'user')}: {turn.get('text', '')}" for turn in conversation_history])
-                prompt = f"Call History:\n{history_text}\nCustomer just said: \"{user_message}\"\nYour response as {agent_name}:"
+                prompt = f"Chat History:\n{history_text}\nCustomer just messaged: \"{user_message}\"\nYour response as {agent_name}:"
                 
                 config = types.GenerateContentConfig(system_instruction=system_prompt) if types else None
                 response = await client.aio.models.generate_content(
