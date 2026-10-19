@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import APIRouter, Request, HTTPException, WebSocket, WebSocketDisconnect, Query
@@ -257,8 +257,6 @@ async def handle_openwa_webhook(request: Request):
             # Skip group messages
             return {"status": "ignored", "reason": "group_message"}
 
-        clean_phone = re.sub(r"[^\d]", "", sender_jid.split("@")[0])
-        
         # Robust multi-format text extraction (Baileys / WPPConnect / OpenWA Gateway)
         user_text = (
             data.get("body") or 
@@ -278,6 +276,8 @@ async def handle_openwa_webhook(request: Request):
             data.get("pushName") or 
             data.get("sender", {}).get("pushname") or 
             data.get("sender", {}).get("name") or 
+            (data.get("contact", {}) or {}).get("pushName") or
+            (data.get("contact", {}) or {}).get("name") or
             None
         )
 
@@ -292,28 +292,119 @@ async def handle_openwa_webhook(request: Request):
             logger.info(f"Duplicate webhook message [{raw_msg_id}] ignored (idempotent guard).")
             return {"status": "ignored", "reason": "duplicate_webhook_event", "message_id": str(raw_msg_id)}
 
-        logger.info(f"Customer [{clean_phone}] ({push_name or 'WhatsApp Customer'}) replied on WhatsApp: '{user_text}'")
-        formatted_phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
+        is_lid = str(sender_jid).endswith("@lid")
+        resolved_phone: Optional[str] = None
+
+        # 1. Check if OpenWA already provided resolved sender phone in the event payload
+        if data.get("senderPhone"):
+            resolved_phone = str(data["senderPhone"]).strip()
+        elif data.get("sender_phone"):
+            resolved_phone = str(data["sender_phone"]).strip()
+
+        # 2. Check author or sender id fields for a real @c.us / MSISDN phone
+        if not resolved_phone:
+            author = str(data.get("author") or "")
+            if author and not author.endswith("@lid") and "@" in author:
+                resolved_phone = author.split("@")[0]
+
+        if not resolved_phone:
+            sender_id = str((data.get("sender", {}) or {}).get("id") or "")
+            if sender_id and not sender_id.endswith("@lid") and "@" in sender_id:
+                resolved_phone = sender_id.split("@")[0]
+
+        if not resolved_phone and (data.get("contact", {}) or {}).get("number"):
+            resolved_phone = str(data["contact"]["number"]).strip()
+
+        # 3. If still unresolved and sender is an @lid, query OpenWA Gateway directly
+        if is_lid and not resolved_phone:
+            try:
+                openwa_resolved = await openwa_provider.resolve_lid_to_phone(sender_jid)
+                if openwa_resolved:
+                    resolved_phone = openwa_resolved
+                    logger.info(f"Successfully resolved @lid {sender_jid} -> phone {resolved_phone} via OpenWA API")
+            except Exception as e:
+                logger.debug(f"OpenWA LID resolve attempt notice: {e}")
+
+        logger.info(f"Incoming WhatsApp message from sender_jid='{sender_jid}', resolved_phone='{resolved_phone}', push_name='{push_name}': '{user_text}'")
 
         async with AsyncSessionLocal() as db:
             try:
-                # Find or create active WhatsApp conversation thread
-                phone_variants = [clean_phone, f"+{clean_phone}"]
-                if len(clean_phone) >= 10:
-                    last10 = clean_phone[-10:]
-                    phone_variants.extend([last10, f"+91{last10}", f"+1{last10}"])
+                conv: Optional[WhatsAppConversation] = None
 
-                conv_stmt = select(WhatsAppConversation).where(
-                    WhatsAppConversation.phone_number.in_(phone_variants)
+                # Step A: Check if this chat_jid (@lid or @c.us) is already linked to an existing conversation
+                jid_stmt = select(WhatsAppConversation).where(
+                    WhatsAppConversation.chat_jid == sender_jid
                 ).order_by(desc(WhatsAppConversation.updated_at))
-                conv_res = await db.execute(conv_stmt)
-                conv = conv_res.scalars().first()
+                jid_res = await db.execute(jid_stmt)
+                conv = jid_res.scalars().first()
+
+                # Step B: If resolved_phone is available, find conversation by phone number variants
+                if not conv and resolved_phone:
+                    r_clean = re.sub(r"[^\d]", "", resolved_phone)
+                    r_variants = [resolved_phone, r_clean, f"+{r_clean}"]
+                    if len(r_clean) >= 10:
+                        r_last10 = r_clean[-10:]
+                        r_variants.extend([r_last10, f"+91{r_last10}", f"+1{r_last10}"])
+                    r_stmt = select(WhatsAppConversation).where(
+                        WhatsAppConversation.phone_number.in_(r_variants)
+                    ).order_by(desc(WhatsAppConversation.updated_at))
+                    r_res = await db.execute(r_stmt)
+                    conv = r_res.scalars().first()
+
+                # Step C: If sender_jid is NOT an LID (e.g. 917069812116@c.us), match directly by phone variants
+                if not conv and not is_lid:
+                    clean_phone = re.sub(r"[^\d]", "", sender_jid.split("@")[0])
+                    phone_variants = [clean_phone, f"+{clean_phone}"]
+                    if len(clean_phone) >= 10:
+                        last10 = clean_phone[-10:]
+                        phone_variants.extend([last10, f"+91{last10}", f"+1{last10}"])
+
+                    conv_stmt = select(WhatsAppConversation).where(
+                        WhatsAppConversation.phone_number.in_(phone_variants)
+                    ).order_by(desc(WhatsAppConversation.updated_at))
+                    conv_res = await db.execute(conv_stmt)
+                    conv = conv_res.scalars().first()
+
+                # Step D: If still not matched and sender is an @lid:
+                # Correlate with recent broadcast recipients who were sent an outbound message recently
+                if not conv and is_lid:
+                    recent_cutoff = datetime.utcnow() - timedelta(hours=4)
+                    candidate_stmt = (
+                        select(WhatsAppConversation)
+                        .join(WhatsAppMessage, WhatsAppMessage.conversation_id == WhatsAppConversation.id)
+                        .where(
+                            WhatsAppMessage.direction == "outbound",
+                            WhatsAppMessage.created_at >= recent_cutoff
+                        )
+                        .order_by(desc(WhatsAppMessage.created_at))
+                        .limit(10)
+                    )
+                    cand_res = await db.execute(candidate_stmt)
+                    candidates = cand_res.scalars().all()
+
+                    # Check 1: push_name matches contact name (e.g. "Umang" matches "Umang")
+                    if push_name:
+                        for c in candidates:
+                            c_n = (c.contact_name or "").lower().strip()
+                            p_n = push_name.lower().strip()
+                            if c_n and p_n and (c_n in p_n or p_n in c_n):
+                                conv = c
+                                logger.info(f"Matched @lid {sender_jid} by push_name '{push_name}' to existing conversation: {c.contact_name} ({c.phone_number})")
+                                break
+
+                    # Check 2: If there's only 1 recent outbound broadcast conversation in the window, link to it
+                    if not conv and len(candidates) == 1:
+                        conv = candidates[0]
+                        logger.info(f"Matched @lid {sender_jid} to the single recent broadcast recipient: {conv.contact_name} ({conv.phone_number})")
 
                 comp_stmt = select(CompanyProfile).order_by(desc(CompanyProfile.created_at)).limit(1)
                 comp_res = await db.execute(comp_stmt)
                 company_profile = comp_res.scalar_one_or_none()
 
                 if not conv:
+                    # Brand new inbound thread
+                    phone_to_save = resolved_phone or re.sub(r"[^\d]", "", sender_jid.split("@")[0])
+                    formatted_phone = f"+{phone_to_save}" if not phone_to_save.startswith("+") else phone_to_save
                     conv = WhatsAppConversation(
                         user_id=company_profile.user_id if company_profile else None,
                         phone_number=formatted_phone,
@@ -325,9 +416,16 @@ async def handle_openwa_webhook(request: Request):
                     db.add(conv)
                     await db.commit()
                     await db.refresh(conv)
-                elif push_name and (conv.contact_name in ["WhatsApp Customer", "Customer", None, ""]):
-                    conv.contact_name = push_name
+                    logger.info(f"Created new conversation thread {conv.id} for phone {conv.phone_number}")
+                else:
+                    # Link chat_jid so all subsequent incoming/outgoing messages use this JID seamlessly
+                    conv.chat_jid = sender_jid
+                    if push_name and (conv.contact_name in ["WhatsApp Customer", "Customer", None, ""]):
+                        conv.contact_name = push_name
+                    conv.last_message_text = user_text
+                    conv.last_message_at = datetime.utcnow()
                     await db.commit()
+                    logger.info(f"Appended incoming message to existing conversation thread {conv.id} for {conv.contact_name} ({conv.phone_number})")
 
                 # Record customer's incoming message
                 cust_msg = WhatsAppMessage(
@@ -531,6 +629,13 @@ async def get_conversation_messages(phone_number: str):
             conv = fallback_res.scalars().first()
 
         if not conv:
+            fallback_jid_stmt = select(WhatsAppConversation).where(
+                WhatsAppConversation.chat_jid.in_([phone_number, f"{clean_digits}@c.us", f"{clean_digits}@lid"])
+            ).order_by(desc(WhatsAppConversation.updated_at))
+            fallback_jid_res = await db.execute(fallback_jid_stmt)
+            conv = fallback_jid_res.scalars().first()
+
+        if not conv:
             return {"conversation": None, "messages": []}
 
         msg_stmt = (
@@ -582,13 +687,33 @@ async def post_conversation_customer_reply(phone_number: str, payload: Conversat
     sender_jid = f"{clean_digits}@c.us"
     formatted_phone = f"+{clean_digits}" if not phone_number.startswith("+") else phone_number
 
+    phone_variants = [phone_number, clean_digits, f"+{clean_digits}"]
+    if len(clean_digits) >= 10:
+        last10 = clean_digits[-10:]
+        phone_variants.extend([last10, f"+91{last10}", f"+1{last10}"])
+
     async with AsyncSessionLocal() as db:
         try:
             stmt = select(WhatsAppConversation).where(
-                WhatsAppConversation.phone_number.in_([phone_number, clean_digits, f"+{clean_digits}"])
+                WhatsAppConversation.phone_number.in_(phone_variants)
             ).order_by(desc(WhatsAppConversation.updated_at))
             res = await db.execute(stmt)
             conv = res.scalars().first()
+
+            if not conv and len(clean_digits) >= 10:
+                last10 = clean_digits[-10:]
+                fallback_stmt = select(WhatsAppConversation).where(
+                    WhatsAppConversation.phone_number.like(f"%{last10}")
+                ).order_by(desc(WhatsAppConversation.updated_at))
+                fallback_res = await db.execute(fallback_stmt)
+                conv = fallback_res.scalars().first()
+
+            if not conv:
+                fallback_jid_stmt = select(WhatsAppConversation).where(
+                    WhatsAppConversation.chat_jid.in_([phone_number, f"{clean_digits}@c.us", f"{clean_digits}@lid"])
+                ).order_by(desc(WhatsAppConversation.updated_at))
+                fallback_jid_res = await db.execute(fallback_jid_stmt)
+                conv = fallback_jid_res.scalars().first()
 
             comp_stmt = select(CompanyProfile).order_by(desc(CompanyProfile.created_at)).limit(1)
             comp_res = await db.execute(comp_stmt)
@@ -607,13 +732,15 @@ async def post_conversation_customer_reply(phone_number: str, payload: Conversat
                 await db.commit()
                 await db.refresh(conv)
 
+            target_chat_id = conv.chat_jid if (conv and conv.chat_jid) else sender_jid
+
             cust_msg = WhatsAppMessage(
                 conversation_id=conv.id,
                 sender="customer",
                 direction="inbound",
                 message_text=user_text,
                 status="received",
-                chat_jid=sender_jid,
+                chat_jid=target_chat_id,
                 ai_generated=False
             )
             db.add(cust_msg)
@@ -723,7 +850,7 @@ async def post_conversation_customer_reply(phone_number: str, payload: Conversat
                     status_data = await openwa_provider.get_session_status()
                     if status_data.get("status") in ["ready", "CONNECTED", "AUTHENTICATED"]:
                         await openwa_provider.send_text_message(
-                            chat_id=sender_jid,
+                            chat_id=target_chat_id,
                             text=agent_reply
                         )
                 except Exception as se:

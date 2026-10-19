@@ -69,6 +69,7 @@ services:
       - MEDIA_LOCAL_PATH=/app/data/media
       - MEDIA_CONVERSION_ENABLED=true
       - ENABLE_SWAGGER=true
+      - RESOLVE_LID_TO_PHONE=true
       - WEBHOOK_SSRF_PROTECT=false
       - SSRF_ALLOWED_HOSTS=backend,host.docker.internal,localhost,127.0.0.1
       # Direct internal Docker communication to FastAPI Webhook endpoint

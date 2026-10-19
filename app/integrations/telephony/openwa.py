@@ -77,6 +77,33 @@ class OpenWATelephonyProvider(TelephonyProvider):
             return phone.strip()
         return f"{clean_num}@c.us"
 
+    async def resolve_lid_to_phone(self, contact_id: str) -> Optional[str]:
+        """
+        Resolve a WhatsApp contact ID (specifically an @lid JID) to real MSISDN phone digits.
+        Queries OpenWA endpoint: GET /api/sessions/{session_id}/contacts/{contact_id}/phone
+        """
+        if not contact_id:
+            return None
+        c_str = str(contact_id).strip()
+        if not c_str.endswith("@lid"):
+            clean = re.sub(r"[^\d]", "", c_str)
+            return clean if len(clean) >= 10 else None
+
+        url = f"{self.base_url}/api/sessions/{self.session_id}/contacts/{c_str}/phone"
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                res = await client.get(url, headers=self.get_auth_headers())
+                if res.status_code == 200:
+                    data = res.json()
+                    p = data.get("phone")
+                    if p:
+                        clean_p = re.sub(r"[^\d]", "", str(p))
+                        if len(clean_p) >= 10:
+                            return clean_p
+        except Exception as e:
+            logger.debug(f"OpenWA resolvePhone for {contact_id} note: {e}")
+        return None
+
     async def get_session_status(self) -> Dict[str, Any]:
         """Fetch current WhatsApp session status from OpenWA Gateway."""
         url = f"{self.base_url}/api/sessions/{self.session_id}"

@@ -24,6 +24,7 @@ import uuid
 import asyncio
 import base64
 import logging
+import re
 from app.integrations.telephony.openwa import OpenWATelephonyProvider
 
 logger = logging.getLogger(__name__)
@@ -472,7 +473,7 @@ async def remove_contact_from_campaign(
 async def list_campaign_contacts(
     campaign_id: uuid.UUID,
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 500,
     status_filter: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)
@@ -492,12 +493,24 @@ async def list_campaign_contacts(
 
     output = []
     for cc, contact in rows:
-        # Fetch latest conversation for this contact
+        # Fetch latest conversation for this contact by contact_id or phone number
         conv_q = select(WhatsAppConversation).where(
             WhatsAppConversation.contact_id == contact.id
         ).order_by(WhatsAppConversation.updated_at.desc()).limit(1)
         conv_res = await db.execute(conv_q)
         latest_conv = conv_res.scalar_one_or_none()
+
+        if not latest_conv:
+            phone_variants = [contact.phone_number, contact.phone_number_normalized]
+            clean_digits = re.sub(r"[^\d]", "", contact.phone_number_normalized or contact.phone_number or "")
+            if len(clean_digits) >= 10:
+                phone_variants.extend([clean_digits, f"+{clean_digits}", clean_digits[-10:], f"+91{clean_digits[-10:]}"])
+            phone_variants = [p for p in phone_variants if p]
+            conv_q2 = select(WhatsAppConversation).where(
+                WhatsAppConversation.phone_number.in_(phone_variants)
+            ).order_by(WhatsAppConversation.updated_at.desc()).limit(1)
+            conv_res2 = await db.execute(conv_q2)
+            latest_conv = conv_res2.scalar_one_or_none()
 
         call_data = None
         if latest_conv:

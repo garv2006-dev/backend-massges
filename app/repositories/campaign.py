@@ -1,8 +1,9 @@
 from typing import Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func, delete as sql_delete
+from sqlalchemy import select, and_, func, delete as sql_delete, update as sql_update
 from app.models.campaign import Campaign
 from app.models.campaign_contact import CampaignContact
+from app.models.whatsapp_message import WhatsAppMessage
 from app.schemas.campaign import CampaignCreate, CampaignUpdate, CampaignContactCreate
 import uuid
 
@@ -49,6 +50,7 @@ class CampaignRepository:
         if not db_campaign:
             return False
         
+        await self.db.execute(sql_update(WhatsAppMessage).where(WhatsAppMessage.campaign_id == campaign_id).values(campaign_id=None))
         await self.db.execute(sql_delete(CampaignContact).where(CampaignContact.campaign_id == campaign_id))
         await self.db.delete(db_campaign)
         await self.db.commit()
@@ -57,7 +59,7 @@ class CampaignRepository:
     async def list(self, skip: int = 0, limit: int = 100, created_by: Optional[uuid.UUID] = None, status: Optional[str] = None) -> List[Campaign]:
         query = select(Campaign)
         if created_by:
-            query = query.where(Campaign.created_by == created_by)
+            query = query.where((Campaign.created_by == created_by) | (Campaign.created_by.is_(None)))
         if status:
             query = query.where(Campaign.status == status)
         result = await self.db.execute(query.order_by(Campaign.created_at.desc()).offset(skip).limit(limit))

@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case, literal_column
+from sqlalchemy import select, func, case, literal_column, and_
 from app.database import get_db
 from app.schemas.common import DashboardStats
 from app.core.deps import get_current_user
@@ -22,14 +22,21 @@ async def get_dashboard_stats(
     contacts_result = await db.execute(select(func.count(Contact.id)))
     total_contacts = contacts_result.scalar() or 0
     
-    # Total campaigns
-    campaigns_result = await db.execute(select(func.count(Campaign.id)))
+    # Total campaigns belonging to user or global default
+    campaigns_result = await db.execute(
+        select(func.count(Campaign.id)).where(
+            (Campaign.created_by == current_user.id) | (Campaign.created_by.is_(None))
+        )
+    )
     total_campaigns = campaigns_result.scalar() or 0
     
     # Active campaigns (queued or in_progress)
     active_result = await db.execute(
         select(func.count(Campaign.id)).where(
-            Campaign.status.in_(["queued", "in_progress"])
+            and_(
+                Campaign.status.in_(["queued", "in_progress"]),
+                (Campaign.created_by == current_user.id) | (Campaign.created_by.is_(None))
+            )
         )
     )
     active_campaigns = active_result.scalar() or 0
