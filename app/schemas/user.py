@@ -34,6 +34,7 @@ class User(UserInDB):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    expires_in: Optional[int] = 604800  # 7 days in seconds
     onboarding_completed: Optional[bool] = False
     user: Optional[User] = None
 

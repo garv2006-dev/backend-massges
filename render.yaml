@@ -36,7 +36,7 @@ services:
       - key: ALGORITHM
         value: HS256
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
-        value: "60"
+        value: "10080"
       - key: GEMINI_API_KEY
         sync: false
       - key: FRONTEND_ORIGIN

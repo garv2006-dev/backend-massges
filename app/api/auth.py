@@ -57,6 +57,7 @@ async def login(
     return {
         "access_token": access_token,
         "token_type": "bearer",
+        "expires_in": 7 * 24 * 60 * 60,  # 7 days in seconds (604,800s)
         "onboarding_completed": bool(getattr(user, "onboarding_completed", False)),
         "user": user,
     }
