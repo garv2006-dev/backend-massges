@@ -44,6 +44,7 @@ class OpenWATelephonyProvider(TelephonyProvider):
         raw_session = session_id or getattr(settings, "OPENWA_SESSION_ID", "default")
         self.session_id = raw_session.strip() if isinstance(raw_session, str) else raw_session
         self.webhook_secret = webhook_secret or getattr(settings, "OPENWA_WEBHOOK_SECRET", None)
+        self._resolved_session_id: Optional[str] = None
 
     @property
     def provider_name(self) -> str:
@@ -66,6 +67,44 @@ class OpenWATelephonyProvider(TelephonyProvider):
         if self.api_key:
             headers["X-API-Key"] = str(self.api_key).strip()
         return headers
+
+    async def resolve_session_uuid(self) -> str:
+        """
+        OpenWA v0.25+ identifies sessions by UUID (e.g. 04defc4a-...).
+        This helper resolves self.session_id (which might be 'default')
+        to the matching active session UUID, or automatically creates it.
+        """
+        if self._resolved_session_id:
+            return self._resolved_session_id
+
+        # If already formatted as a standard 36-char UUID, use directly
+        if len(self.session_id) == 36 and self.session_id.count("-") == 4:
+            self._resolved_session_id = self.session_id
+            return self.session_id
+
+        url = f"{self.base_url}/api/sessions"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(url, headers=self.get_auth_headers())
+                if res.status_code == 200:
+                    sessions = res.json()
+                    if isinstance(sessions, list):
+                        for s in sessions:
+                            if s.get("name") == self.session_id or s.get("id") == self.session_id:
+                                self._resolved_session_id = s.get("id")
+                                return self._resolved_session_id
+
+                # If session does not exist yet, create it with payload {"name": self.session_id}
+                create_res = await client.post(url, json={"name": self.session_id}, headers=self.get_auth_headers())
+                if create_res.status_code in [200, 201]:
+                    new_session = create_res.json()
+                    if new_session.get("id"):
+                        self._resolved_session_id = new_session.get("id")
+                        return self._resolved_session_id
+        except Exception as e:
+            logger.debug(f"OpenWA resolve_session_uuid notice: {e}")
+
+        return self.session_id
 
     def normalize_phone_to_jid(self, phone: str) -> str:
         """
@@ -91,7 +130,8 @@ class OpenWATelephonyProvider(TelephonyProvider):
             clean = re.sub(r"[^\d]", "", c_str)
             return clean if len(clean) >= 10 else None
 
-        url = f"{self.base_url}/api/sessions/{self.session_id}/contacts/{c_str}/phone"
+        sid = await self.resolve_session_uuid()
+        url = f"{self.base_url}/api/sessions/{sid}/contacts/{c_str}/phone"
         try:
             async with httpx.AsyncClient(timeout=4.0) as client:
                 res = await client.get(url, headers=self.get_auth_headers())
@@ -108,7 +148,8 @@ class OpenWATelephonyProvider(TelephonyProvider):
 
     async def get_session_status(self) -> Dict[str, Any]:
         """Fetch current WhatsApp session status from OpenWA Gateway."""
-        url = f"{self.base_url}/api/sessions/{self.session_id}"
+        sid = await self.resolve_session_uuid()
+        url = f"{self.base_url}/api/sessions/{sid}"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get(url, headers=self.get_auth_headers())
@@ -128,7 +169,8 @@ class OpenWATelephonyProvider(TelephonyProvider):
 
     async def get_session_qr(self) -> Dict[str, Any]:
         """Retrieve QR code data URL from OpenWA for WhatsApp device linking."""
-        url = f"{self.base_url}/api/sessions/{self.session_id}/qr"
+        sid = await self.resolve_session_uuid()
+        url = f"{self.base_url}/api/sessions/{sid}/qr"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get(url, headers=self.get_auth_headers())
@@ -137,6 +179,9 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     # OpenWA returns { qrCode: "data:image/png;base64,..." } or { qr: "..." }
                     qr_val = data.get("qrCode") or data.get("qr") or (data if isinstance(data, str) else "")
                     return {"success": True, "qr": qr_val}
+                # If session is not started yet, automatically start it
+                if res.status_code in [400, 404]:
+                    await self.create_or_start_session()
                 return {"success": False, "statusCode": res.status_code, "detail": res.text}
         except Exception as e:
             logger.error(f"Error fetching OpenWA QR code: {e}")
@@ -144,16 +189,19 @@ class OpenWATelephonyProvider(TelephonyProvider):
 
     async def create_or_start_session(self) -> Dict[str, Any]:
         """Create or initialize WhatsApp session on OpenWA gateway."""
-        url = f"{self.base_url}/api/sessions"
-        payload = {"sessionId": self.session_id}
+        sid = await self.resolve_session_uuid()
+        start_url = f"{self.base_url}/api/sessions/{sid}/start"
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.post(url, json=payload, headers=self.get_auth_headers())
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                res = await client.post(start_url, json={}, headers=self.get_auth_headers())
                 if res.status_code in [200, 201]:
                     return res.json()
+                # If 404, reset cached id and try again
+                if res.status_code == 404:
+                    self._resolved_session_id = None
                 return {"success": False, "statusCode": res.status_code, "detail": res.text}
         except Exception as e:
-            logger.error(f"Error creating OpenWA session: {e}")
+            logger.error(f"Error starting OpenWA session: {e}")
             return {"success": False, "error": str(e)}
 
     async def ensure_webhook_registered(self) -> Dict[str, Any]:
@@ -163,7 +211,8 @@ class OpenWATelephonyProvider(TelephonyProvider):
             webhook_target = "http://host.docker.internal:8000"
         
         target_url = f"{webhook_target.rstrip('/')}/api/telephony/openwa/webhook"
-        list_url = f"{self.base_url}/api/sessions/{self.session_id}/webhooks"
+        sid = await self.resolve_session_uuid()
+        list_url = f"{self.base_url}/api/sessions/{sid}/webhooks"
         headers = self.get_auth_headers()
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -221,7 +270,8 @@ class OpenWATelephonyProvider(TelephonyProvider):
 
     async def send_text_message(self, chat_id: str, text: str) -> Dict[str, Any]:
         """Send a WhatsApp text message through OpenWA."""
-        url = f"{self.base_url}/api/sessions/{self.session_id}/messages/send-text"
+        sid = await self.resolve_session_uuid()
+        url = f"{self.base_url}/api/sessions/{sid}/messages/send-text"
         payload = {
             "chatId": chat_id,
             "text": text
@@ -247,7 +297,8 @@ class OpenWATelephonyProvider(TelephonyProvider):
         """
         Send audio as real WhatsApp Voice Note (PTT) with waveform.
         """
-        url = f"{self.base_url}/api/sessions/{self.session_id}/messages/send-audio"
+        sid = await self.resolve_session_uuid()
+        url = f"{self.base_url}/api/sessions/{sid}/messages/send-audio"
         b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
         payload = {
             "chatId": chat_id,

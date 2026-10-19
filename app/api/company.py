@@ -144,16 +144,11 @@ async def start_whatsapp_session():
     """
     Ensure the WhatsApp session is booted and generating QR code in OpenWA Gateway.
     """
-    url = f"{openwa_provider.base_url}/api/sessions/{openwa_provider.session_id}/start"
-    headers = openwa_provider.get_auth_headers()
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            res = await client.post(url, headers=headers)
-            # Ensure webhook is actively registered for inbound message auto-reply
-            await openwa_provider.ensure_webhook_registered()
-            if res.status_code in [200, 201]:
-                return {"success": True, "data": res.json()}
-            return {"success": False, "statusCode": res.status_code, "detail": res.text}
+        res = await openwa_provider.create_or_start_session()
+        # Ensure webhook is actively registered for inbound message auto-reply
+        await openwa_provider.ensure_webhook_registered()
+        return {"success": True, "data": res}
     except Exception as e:
         logger.error(f"Error starting OpenWA session: {e}")
         return {"success": False, "error": str(e)}
