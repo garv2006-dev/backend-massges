@@ -38,9 +38,11 @@ class OpenWATelephonyProvider(TelephonyProvider):
         session_id: Optional[str] = None,
         webhook_secret: Optional[str] = None
     ):
-        self.base_url = (base_url or getattr(settings, "OPENWA_BASE_URL", "http://localhost:2785")).rstrip("/")
-        self.api_key = getattr(settings, "OPENWA_API_KEY", None) if api_key is SENTINEL else api_key
-        self.session_id = session_id or getattr(settings, "OPENWA_SESSION_ID", "default")
+        self.base_url = (base_url or getattr(settings, "OPENWA_BASE_URL", "http://localhost:2785")).strip().rstrip("/")
+        raw_key = getattr(settings, "OPENWA_API_KEY", None) if api_key is SENTINEL else api_key
+        self.api_key = raw_key.strip() if isinstance(raw_key, str) else raw_key
+        raw_session = session_id or getattr(settings, "OPENWA_SESSION_ID", "default")
+        self.session_id = raw_session.strip() if isinstance(raw_session, str) else raw_session
         self.webhook_secret = webhook_secret or getattr(settings, "OPENWA_WEBHOOK_SECRET", None)
 
     @property
@@ -62,7 +64,7 @@ class OpenWATelephonyProvider(TelephonyProvider):
             "Accept": "application/json"
         }
         if self.api_key:
-            headers["X-API-Key"] = self.api_key
+            headers["X-API-Key"] = str(self.api_key).strip()
         return headers
 
     def normalize_phone_to_jid(self, phone: str) -> str:
