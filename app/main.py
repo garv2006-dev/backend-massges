@@ -32,17 +32,24 @@ app = FastAPI(
 )
 
 # CORS middleware
-origins = list({
-    settings.FRONTEND_ORIGIN,
+origins = {
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-})
+}
+if settings.FRONTEND_ORIGIN:
+    for o in settings.FRONTEND_ORIGIN.split(","):
+        cleaned = o.strip().rstrip("/")
+        if cleaned:
+            origins.add(cleaned)
+
+allow_all = "*" in origins
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"] if allow_all else list(origins),
+    allow_origin_regex=r"https://.*\.pages\.dev" if not allow_all else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

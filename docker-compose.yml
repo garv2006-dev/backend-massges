@@ -1,0 +1,127 @@
+# ====================================================================
+# Backend Production Docker Compose Stack
+# Includes: PostgreSQL + Redis + OpenWA WhatsApp Gateway + FastAPI Backend
+# ====================================================================
+# Quick Start:
+#   1. cp .env.production.example .env.production
+#   2. Fill in your GEMINI_API_KEY, SECRET_KEY, and OPENWA_API_KEY
+#   3. docker compose --env-file .env.production up -d --build
+# ====================================================================
+
+services:
+  # ------------------------------------------------------------------
+  # 1. PostgreSQL Database
+  # ------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: voice-calling-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_secure_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-voice_platform}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-voice_platform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------
+  # 2. Redis (Cache & Background Workers)
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: voice-calling-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------
+  # 3. OpenWA WhatsApp API Gateway (Headless WhatsApp Web in Docker)
+  # ------------------------------------------------------------------
+  openwa:
+    image: ghcr.io/rmyndharis/openwa:latest
+    container_name: openwa-gateway
+    restart: unless-stopped
+    # CRITICAL: Chromium requires >=1GB shared memory to avoid SIGBUS/crash
+    shm_size: '1gb'
+    ports:
+      - "2785:2785"
+    environment:
+      - PORT=2785
+      - NODE_ENV=production
+      - API_KEY=${OPENWA_API_KEY:-}
+      - DB_TYPE=sqlite
+      - DB_SQLITE_PATH=/app/data/openwa.sqlite
+      - MEDIA_STORAGE=local
+      - MEDIA_LOCAL_PATH=/app/data/media
+      - MEDIA_CONVERSION_ENABLED=true
+      - ENABLE_SWAGGER=true
+      - WEBHOOK_SSRF_PROTECT=false
+      - SSRF_ALLOWED_HOSTS=backend,host.docker.internal,localhost,127.0.0.1
+      # Direct internal Docker communication to FastAPI Webhook endpoint
+      - WEBHOOK_URL=http://backend:8000/api/telephony/openwa/webhook
+    volumes:
+      # CRITICAL: Persists WhatsApp session auth keys across restarts
+      - openwa_data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ------------------------------------------------------------------
+  # 4. FastAPI Backend Application (AI Orchestration & Business Logic)
+  # ------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice-calling-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_secure_pass}@postgres:5432/${POSTGRES_DB:-voice_platform}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-your_super_secret_jwt_key_here_change_in_production}
+      - ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=60
+      - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-http://localhost:3000}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY:-}
+      - OPENWA_BASE_URL=http://openwa:2785
+      - OPENWA_API_KEY=${OPENWA_API_KEY:-}
+      - OPENWA_SESSION_ID=default
+      - CAMPAIGN_CONCURRENCY_LIMIT=${CAMPAIGN_CONCURRENCY_LIMIT:-5}
+      - DEFAULT_PHONE_REGION=${DEFAULT_PHONE_REGION:-IN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      openwa:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  openwa_data:
+    driver: local

@@ -1,0 +1,91 @@
+# ====================================================================
+# Render Blueprint (render.yaml)
+# AI Voice Calling & WhatsApp Outreach Platform (Backend)
+# ====================================================================
+
+services:
+  # ------------------------------------------------------------------
+  # 1. FastAPI Backend Service
+  # ------------------------------------------------------------------
+  - type: web
+    name: voice-calling-backend
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: voice-calling-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: voice-calling-redis
+          property: connectionString
+      - key: OPENWA_BASE_URL
+        value: http://openwa-gateway:2785
+      - key: OPENWA_SESSION_ID
+        value: default
+      - key: OPENWA_API_KEY
+        generateValue: true
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "60"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGIN
+        sync: false  # Set to your Cloudflare Pages URL (e.g., https://your-project.pages.dev)
+      - key: PUBLIC_WEBHOOK_URL
+        sync: false  # Will be https://voice-calling-backend.onrender.com
+
+  # ------------------------------------------------------------------
+  # 2. OpenWA WhatsApp Gateway (Headless WhatsApp Web in Docker)
+  # ------------------------------------------------------------------
+  - type: web
+    name: openwa-gateway
+    runtime: image
+    image:
+      url: ghcr.io/rmyndharis/openwa:latest
+    plan: starter # Starter ($7/mo) provides 1GB RAM required by Chromium
+    region: oregon
+    disk:
+      name: openwa-data
+      mountPath: /app/data
+      sizeGB: 5
+    envVars:
+      - key: PORT
+        value: "2785"
+      - key: NODE_ENV
+        value: production
+      - key: DB_TYPE
+        value: sqlite
+      - key: DB_SQLITE_PATH
+        value: /app/data/openwa.sqlite
+      - key: MEDIA_STORAGE
+        value: local
+      - key: MEDIA_LOCAL_PATH
+        value: /app/data/media
+      - key: MEDIA_CONVERSION_ENABLED
+        value: "true"
+      - key: ENABLE_SWAGGER
+        value: "true"
+      - key: WEBHOOK_SSRF_PROTECT
+        value: "false"
+      - key: API_KEY
+        fromService:
+          type: web
+          name: voice-calling-backend
+          envVarKey: OPENWA_API_KEY
+
+databases:
+  - name: voice-calling-db
+    databaseName: voice_platform
+    user: postgres
+    plan: starter
+    region: oregon
