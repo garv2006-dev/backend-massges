@@ -25,7 +25,7 @@ from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.whatsapp_message import WhatsAppMessage
 from app.models.company_profile import CompanyProfile
 from app.services.ai_voice_engine import AIVoiceEngine
-from app.integrations.telephony.openwa import OpenWATelephonyProvider
+from app.integrations.telephony.openwa import OpenWATelephonyProvider, get_public_webhook_url
 from app.security.jwt import decode_access_token
 
 logger = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ async def get_openwa_gateway_status():
     Returns gateway reachability, session state, and configuration.
     """
     session_status = await openwa_provider.get_session_status()
-    is_connected = session_status.get("status") in ["ready", "CONNECTED", "AUTHENTICATED"]
+    is_connected = openwa_provider.is_session_connected(session_status)
 
     return {
         "gateway_url": openwa_provider.base_url,
@@ -151,8 +151,36 @@ async def get_openwa_qr_code():
     """
     Retrieve current WhatsApp QR code from OpenWA for phone pairing.
     """
+    # If session is already connected/paired, return authenticated state immediately
+    if openwa_provider.is_session_connected(openwa_provider._status_cache):
+        return {
+            "success": True,
+            "already_authenticated": True,
+            "is_connected": True,
+            "message": "WhatsApp is already connected and authenticated. No QR code needed.",
+            "qr": None
+        }
     qr_data = await openwa_provider.get_session_qr()
     return qr_data
+
+
+@router.get("/openwa/webhooks")
+async def list_openwa_webhooks():
+    """List webhooks currently registered on the active OpenWA session."""
+    hooks = await openwa_provider.get_session_webhooks()
+    pub_base = get_public_webhook_url()
+    return {
+        "registered_webhooks": hooks,
+        "configured_public_webhook_url": f"{pub_base}/api/telephony/openwa/webhook",
+        "gateway_url": openwa_provider.base_url
+    }
+
+
+@router.post("/openwa/register-webhook")
+async def register_openwa_webhook():
+    """Ensure the backend public webhook is registered with the OpenWA session."""
+    res = await openwa_provider.ensure_webhook_registered()
+    return res
 
 
 @router.post("/openwa/init-session")
@@ -561,8 +589,9 @@ async def handle_openwa_webhook(request: Request):
 
                 # Deliver pure human-like text reply directly via OpenWA
                 try:
+                    target_reply_jid = sender_jid or conv.chat_jid or openwa_provider.normalize_phone_to_jid(conv.phone_number)
                     await openwa_provider.send_text_message(
-                        chat_id=sender_jid,
+                        chat_id=target_reply_jid,
                         text=agent_reply
                     )
                 except Exception as se:

@@ -13,6 +13,8 @@ import logging
 import asyncio
 import hmac
 import hashlib
+import time
+import json
 from typing import Dict, Any, Optional, List
 import httpx
 import edge_tts
@@ -27,26 +29,73 @@ SENTINEL = object()
 
 
 def clean_error_response(status_code: int, raw_text: str) -> str:
-    """Extract clean, human-readable error description from gateway response (handles HTML 502/503/504)."""
+    """Extract clean, user-friendly description without exposing raw system dumps or JSON."""
     if not raw_text:
-        return f"HTTP {status_code} Error"
+        return f"Gateway response error ({status_code})"
     text = str(raw_text).strip()
+
+    # 1. HTML errors from Render router (502/503/504)
     if text.startswith("<") or "<html" in text.lower():
         if status_code == 502:
-            return "OpenWA Gateway is unavailable (502 Bad Gateway). Service on Render is sleeping, restarting, or unreachable."
+            return "WhatsApp Gateway is waking up from Render sleep (~30s). Please wait a moment."
         elif status_code == 503:
-            return "OpenWA Gateway is temporarily unavailable (503 Service Unavailable). The service may be starting up."
+            return "WhatsApp Gateway is temporarily starting up. Please wait."
         elif status_code == 504:
-            return "OpenWA Gateway request timed out (504 Gateway Timeout)."
-        title_match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE)
-        if title_match:
-            return f"HTTP {status_code}: {title_match.group(1).strip()}"
-        return f"HTTP {status_code} Gateway Error (HTML response received)"
+            return "WhatsApp Gateway connection timed out. Please retry shortly."
+        return "WhatsApp Gateway is starting up."
+
+    # 2. Rate limit / Throttling (429)
+    if status_code == 429 or "throttler" in text.lower() or "too many requests" in text.lower():
+        return "WhatsApp Gateway is briefly busy processing requests. Please wait a moment."
+
+    # 3. Auth error (401)
     if status_code == 401:
-        return "OpenWA Authentication Failed (401 Unauthorized). Check that OPENWA_API_KEY in the backend matches the API_KEY configured on the OpenWA Render service."
-    if len(text) > 300:
-        return text[:300] + "..."
+        return "WhatsApp Gateway authentication failed. Please verify API configuration."
+
+    # 4. JSON parsing for cleaner message
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                msg = data.get("message") or data.get("error") or data.get("detail")
+                if msg:
+                    if isinstance(msg, list):
+                        msg = ", ".join(str(m) for m in msg)
+                    msg_str = str(msg)
+                    if "throttler" in msg_str.lower() or "too many requests" in msg_str.lower():
+                        return "WhatsApp Gateway is briefly busy processing requests. Please wait a moment."
+                    return msg_str
+        except Exception:
+            pass
+        return "WhatsApp Gateway encountered a temporary issue. Please wait a moment."
+
+    if len(text) > 160:
+        return text[:160] + "..."
     return text
+
+
+def get_public_webhook_url() -> str:
+    """Resolve the public HTTPS URL for the backend to receive OpenWA webhooks dynamically from environment variables."""
+    # 1. Primary: Configured in .env file as PUBLIC_WEBHOOK_URL
+    env_url = getattr(settings, "PUBLIC_WEBHOOK_URL", None) or os.getenv("PUBLIC_WEBHOOK_URL")
+    if env_url:
+        clean = str(env_url).strip().rstrip("/")
+        if clean:
+            return clean
+
+    # 2. Render automatic external URL provided by Render environment
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if render_url:
+        return str(render_url).strip().rstrip("/")
+
+    # 3. Railway or custom domain environment variable
+    custom_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_DOMAIN")
+    if custom_domain:
+        c_clean = str(custom_domain).strip().rstrip("/")
+        return f"https://{c_clean}" if not c_clean.startswith("http") else c_clean
+
+    # 4. Local development fallback (configurable via LOCAL_WEBHOOK_URL in .env)
+    return (os.getenv("LOCAL_WEBHOOK_URL") or "http://host.docker.internal:8000").strip().rstrip("/")
 
 
 class OpenWATelephonyProvider(TelephonyProvider):
@@ -69,6 +118,8 @@ class OpenWATelephonyProvider(TelephonyProvider):
         self.session_id = raw_session.strip() if isinstance(raw_session, str) else raw_session
         self.webhook_secret = webhook_secret or getattr(settings, "OPENWA_WEBHOOK_SECRET", None)
         self._resolved_session_id: Optional[str] = None
+        self._status_cache: Optional[Dict[str, Any]] = None
+        self._status_cache_time: float = 0
 
     @property
     def provider_name(self) -> str:
@@ -170,8 +221,27 @@ class OpenWATelephonyProvider(TelephonyProvider):
             logger.debug(f"OpenWA resolvePhone for {contact_id} note: {e}")
         return None
 
-    async def get_session_status(self) -> Dict[str, Any]:
-        """Fetch current WhatsApp session status from OpenWA Gateway with automatic sleep wake-up retry."""
+    def is_session_connected(self, status_data: Optional[Dict[str, Any]]) -> bool:
+        """Helper to reliably determine if session is authenticated/active across all OpenWA variants."""
+        if not status_data or not isinstance(status_data, dict):
+            return False
+        if status_data.get("is_connected") is True or status_data.get("already_authenticated") is True:
+            return True
+        if status_data.get("me") or status_data.get("user") or status_data.get("wid"):
+            return True
+        st = str(status_data.get("status") or "").upper().strip()
+        valid_states = {
+            "READY", "CONNECTED", "AUTHENTICATED", "WORKING", "LOGGED_IN", 
+            "INCHAT", "PAIRED", "ISLOGGED", "QRCODE_NOT_NEEDED"
+        }
+        return st in valid_states
+
+    async def get_session_status(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Fetch current WhatsApp session status with caching to prevent 429 Throttler exceptions."""
+        now = time.time()
+        if not force_refresh and self._status_cache and (now - self._status_cache_time < 10.0):
+            return self._status_cache
+
         sid = await self.resolve_session_uuid()
         url = f"{self.base_url}/api/sessions/{sid}"
         for attempt in range(2):
@@ -180,12 +250,27 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     res = await client.get(url, headers=self.get_auth_headers())
                     if res.status_code == 200:
                         try:
-                            return res.json()
+                            data = res.json()
+                            data["is_connected"] = self.is_session_connected(data)
+                            self._status_cache = data
+                            self._status_cache_time = now
+                            return data
                         except Exception:
-                            return {"status": "ERROR", "message": "Invalid JSON response from OpenWA"}
+                            return {"status": "ERROR", "is_connected": False, "message": "Invalid response from WhatsApp gateway"}
                     elif res.status_code == 404:
-                        return {"status": "DISCONNECTED", "message": f"Session '{self.session_id}' not found"}
-                    
+                        return {"status": "DISCONNECTED", "is_connected": False, "message": f"Session '{self.session_id}' not found"}
+
+                    # If throttled (429), return previous cache or default connected status if previously known
+                    if res.status_code == 429:
+                        if self._status_cache:
+                            logger.info("OpenWA rate limit (429) hit, returning cached status safely")
+                            return self._status_cache
+                        return {
+                            "status": "WORKING",
+                            "is_connected": True,
+                            "message": "WhatsApp Gateway is busy processing requests."
+                        }
+
                     # If 502/503/504 on first attempt, service is waking up on Render: wait and retry
                     if res.status_code in [502, 503, 504] and attempt == 0:
                         logger.info("OpenWA gateway waking up from idle on Render, retrying status check in 3s...")
@@ -195,6 +280,7 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     clean_msg = clean_error_response(res.status_code, res.text)
                     return {
                         "status": "ERROR",
+                        "is_connected": False,
                         "statusCode": res.status_code,
                         "body": clean_msg,
                         "message": clean_msg,
@@ -202,22 +288,33 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     }
             except (httpx.ConnectError, httpx.TimeoutException) as e:
                 if attempt == 0:
-                    logger.info("Timeout/connection probe on OpenWA (container may be booting from Render sleep), retrying in 3s...")
+                    logger.info("Timeout/connection probe on OpenWA, retrying in 3s...")
                     await asyncio.sleep(3.0)
                     continue
                 return {
                     "status": "OFFLINE",
-                    "message": f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or waking up from Render sleep.",
+                    "is_connected": False,
+                    "message": "WhatsApp Gateway is offline or waking up from Render sleep. Please try again shortly.",
                     "is_gateway_unavailable": True
                 }
             except Exception as e:
                 logger.error(f"Error checking OpenWA session status: {e}")
-                return {"status": "ERROR", "message": str(e)}
+                return {"status": "ERROR", "is_connected": False, "message": str(e)}
 
-        return {"status": "ERROR", "message": "Failed to reach OpenWA gateway after retries."}
+        return {"status": "ERROR", "is_connected": False, "message": "Failed to reach WhatsApp gateway after retries."}
 
     async def get_session_qr(self) -> Dict[str, Any]:
         """Retrieve QR code data URL from OpenWA for WhatsApp device linking with auto wake-up retry."""
+        # If we already know the session is authenticated, do not hammer OpenWA for QR code
+        if self._status_cache and self.is_session_connected(self._status_cache):
+            return {
+                "success": True,
+                "already_authenticated": True,
+                "is_connected": True,
+                "message": "WhatsApp is already connected and authenticated. No QR code needed.",
+                "qr": None
+            }
+
         sid = await self.resolve_session_uuid()
         url = f"{self.base_url}/api/sessions/{sid}/qr"
         for attempt in range(2):
@@ -239,11 +336,24 @@ class OpenWATelephonyProvider(TelephonyProvider):
 
                     # If session is already authenticated, no QR code is needed
                     if res.status_code == 400 and ("already authenticated" in res.text.lower() or "no qr code needed" in res.text.lower()):
+                        if self._status_cache:
+                            self._status_cache["is_connected"] = True
+                            self._status_cache["status"] = "WORKING"
                         return {
                             "success": True,
                             "already_authenticated": True,
                             "is_connected": True,
                             "message": "WhatsApp is already connected and authenticated. No QR code needed.",
+                            "qr": None
+                        }
+
+                    # If throttled (429)
+                    if res.status_code == 429:
+                        return {
+                            "success": True,
+                            "already_authenticated": True,
+                            "is_connected": True,
+                            "message": "WhatsApp is already connected and authenticated.",
                             "qr": None
                         }
 
@@ -257,7 +367,6 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     if res.status_code in [400, 404]:
                         start_res = await self.create_or_start_session()
                         if start_res.get("success") is not False:
-                            # Wait briefly for engine to generate the initial QR code
                             await asyncio.sleep(2.0)
                             retry_res = await client.get(url, headers=self.get_auth_headers())
                             if retry_res.status_code == 200:
@@ -286,7 +395,7 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     logger.info("OpenWA connection probe timeout, retrying in 3s...")
                     await asyncio.sleep(3.0)
                     continue
-                err_msg = f"Timed out waiting for OpenWA Gateway at {self.base_url}. Service may be waking up from Render sleep."
+                err_msg = "WhatsApp Gateway is offline or waking up from Render sleep. Please try again shortly."
                 return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
             except Exception as e:
                 logger.error(f"Error fetching OpenWA QR code: {e}")
@@ -370,29 +479,53 @@ class OpenWATelephonyProvider(TelephonyProvider):
             self._resolved_session_id = None
             return {"success": False, "error": str(e)}
 
+    async def get_session_webhooks(self) -> Dict[str, Any]:
+        """Fetch all registered webhooks for the active session in OpenWA."""
+        sid = await self.resolve_session_uuid()
+        url = f"{self.base_url}/api/sessions/{sid}/webhooks"
+        headers = self.get_auth_headers()
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.get(url, headers=headers)
+                if res.status_code == 200:
+                    try:
+                        return {"success": True, "webhooks": res.json()}
+                    except Exception:
+                        return {"success": True, "webhooks": []}
+                clean_msg = clean_error_response(res.status_code, res.text)
+                return {"success": False, "statusCode": res.status_code, "error": clean_msg}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     async def ensure_webhook_registered(self) -> Dict[str, Any]:
         """Ensure the backend webhook is actively registered on OpenWA for real-time customer replies."""
-        webhook_target = getattr(settings, "PUBLIC_WEBHOOK_URL", None)
-        if not webhook_target or any(s in webhook_target for s in ["trycloudflare", "ngrok", "your-"]):
-            webhook_target = "http://host.docker.internal:8000"
-        
-        target_url = f"{webhook_target.rstrip('/')}/api/telephony/openwa/webhook"
+        webhook_target = get_public_webhook_url()
+        target_url = f"{webhook_target}/api/telephony/openwa/webhook"
         sid = await self.resolve_session_uuid()
         list_url = f"{self.base_url}/api/sessions/{sid}/webhooks"
         headers = self.get_auth_headers()
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 res = await client.get(list_url, headers=headers)
                 if res.status_code == 200:
                     try:
                         existing = res.json()
                         if isinstance(existing, list):
                             for hook in existing:
-                                if hook.get("url") == target_url and hook.get("active", True):
-                                    return {"success": True, "already_registered": True, "webhook": hook}
+                                h_url = hook.get("url", "")
+                                # If exact match and active, it's good
+                                if h_url == target_url and hook.get("active", True) is not False:
+                                    return {"success": True, "already_registered": True, "webhook": hook, "url": target_url}
+                                # If stale local/invalid hook, clean it up
+                                if hook.get("id") and any(b in h_url for b in ["host.docker.internal", "localhost", "trycloudflare", "ngrok"]):
+                                    try:
+                                        await client.delete(f"{list_url}/{hook['id']}", headers=headers)
+                                    except Exception:
+                                        pass
                     except Exception:
                         pass
-                # Register webhook
+
+                # Register webhook on OpenWA
                 create_payload = {
                     "url": target_url,
                     "events": ["*"]
@@ -400,13 +533,13 @@ class OpenWATelephonyProvider(TelephonyProvider):
                 c_res = await client.post(list_url, json=create_payload, headers=headers)
                 if c_res.status_code in [200, 201]:
                     logger.info(f"Successfully registered OpenWA webhook to {target_url}")
-                    return {"success": True, "registered": True, "webhook": c_res.json()}
+                    return {"success": True, "registered": True, "webhook": c_res.json(), "url": target_url}
                 clean_msg = clean_error_response(c_res.status_code, c_res.text)
                 logger.warning(f"Could not register OpenWA webhook: {c_res.status_code} - {clean_msg}")
-                return {"success": False, "detail": clean_msg}
+                return {"success": False, "detail": clean_msg, "url": target_url}
         except Exception as e:
             logger.warning(f"Notice on ensuring OpenWA webhook: {e}")
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": str(e), "url": target_url}
 
     async def synthesize_speech_bytes(
         self,
@@ -439,24 +572,45 @@ class OpenWATelephonyProvider(TelephonyProvider):
         return None
 
     async def send_text_message(self, chat_id: str, text: str) -> Dict[str, Any]:
-        """Send a WhatsApp text message through OpenWA."""
+        """Send a WhatsApp text message through OpenWA with format normalization and retry safety."""
+        if not chat_id:
+            logger.error("send_text_message called with empty chat_id")
+            return {"success": False, "error": "chat_id is required"}
+
+        clean_chat_id = str(chat_id).strip()
+        if "@" not in clean_chat_id:
+            clean_chat_id = self.normalize_phone_to_jid(clean_chat_id)
+
         sid = await self.resolve_session_uuid()
         url = f"{self.base_url}/api/sessions/{sid}/messages/send-text"
         payload = {
-            "chatId": chat_id,
+            "chatId": clean_chat_id,
             "text": text
         }
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                res = await client.post(url, json=payload, headers=self.get_auth_headers())
-                if res.status_code in [200, 201]:
-                    return res.json()
-                clean_msg = clean_error_response(res.status_code, res.text)
-                logger.error(f"OpenWA send-text error: {res.status_code} - {clean_msg}")
-                return {"success": False, "statusCode": res.status_code, "detail": clean_msg, "error": clean_msg}
-        except Exception as e:
-            logger.error(f"Failed to send text message via OpenWA: {e}")
-            return {"success": False, "error": str(e)}
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    res = await client.post(url, json=payload, headers=self.get_auth_headers())
+                    if res.status_code in [200, 201]:
+                        return res.json()
+                    clean_msg = clean_error_response(res.status_code, res.text)
+                    logger.error(f"OpenWA send-text attempt {attempt+1} error: {res.status_code} - {clean_msg}")
+                    # If failed on @lid, try converting to phone number @c.us
+                    if "@lid" in clean_chat_id and attempt == 0:
+                        resolved = await self.resolve_lid_to_phone(clean_chat_id)
+                        if resolved:
+                            clean_chat_id = self.normalize_phone_to_jid(resolved)
+                            payload["chatId"] = clean_chat_id
+                            continue
+                    return {"success": False, "statusCode": res.status_code, "detail": clean_msg, "error": clean_msg}
+            except Exception as e:
+                logger.error(f"Failed to send text message via OpenWA (attempt {attempt+1}): {e}")
+                if attempt == 0:
+                    await asyncio.sleep(1.0)
+                    continue
+                return {"success": False, "error": str(e)}
+
+        return {"success": False, "error": "Failed after retries"}
 
     async def send_voice_audio(
         self,
