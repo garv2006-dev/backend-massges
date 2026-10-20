@@ -171,110 +171,151 @@ class OpenWATelephonyProvider(TelephonyProvider):
         return None
 
     async def get_session_status(self) -> Dict[str, Any]:
-        """Fetch current WhatsApp session status from OpenWA Gateway."""
+        """Fetch current WhatsApp session status from OpenWA Gateway with automatic sleep wake-up retry."""
         sid = await self.resolve_session_uuid()
         url = f"{self.base_url}/api/sessions/{sid}"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                res = await client.get(url, headers=self.get_auth_headers())
-                if res.status_code == 200:
-                    try:
-                        return res.json()
-                    except Exception:
-                        return {"status": "ERROR", "message": "Invalid JSON response from OpenWA"}
-                elif res.status_code == 404:
-                    return {"status": "DISCONNECTED", "message": f"Session '{self.session_id}' not found"}
-                clean_msg = clean_error_response(res.status_code, res.text)
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=25.0) as client:
+                    res = await client.get(url, headers=self.get_auth_headers())
+                    if res.status_code == 200:
+                        try:
+                            return res.json()
+                        except Exception:
+                            return {"status": "ERROR", "message": "Invalid JSON response from OpenWA"}
+                    elif res.status_code == 404:
+                        return {"status": "DISCONNECTED", "message": f"Session '{self.session_id}' not found"}
+                    
+                    # If 502/503/504 on first attempt, service is waking up on Render: wait and retry
+                    if res.status_code in [502, 503, 504] and attempt == 0:
+                        logger.info("OpenWA gateway waking up from idle on Render, retrying status check in 3s...")
+                        await asyncio.sleep(3.0)
+                        continue
+
+                    clean_msg = clean_error_response(res.status_code, res.text)
+                    return {
+                        "status": "ERROR",
+                        "statusCode": res.status_code,
+                        "body": clean_msg,
+                        "message": clean_msg,
+                        "is_gateway_unavailable": res.status_code in [502, 503, 504]
+                    }
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                if attempt == 0:
+                    logger.info("Timeout/connection probe on OpenWA (container may be booting from Render sleep), retrying in 3s...")
+                    await asyncio.sleep(3.0)
+                    continue
                 return {
-                    "status": "ERROR",
-                    "statusCode": res.status_code,
-                    "body": clean_msg,
-                    "message": clean_msg,
-                    "is_gateway_unavailable": res.status_code in [502, 503, 504]
+                    "status": "OFFLINE",
+                    "message": f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or waking up from Render sleep.",
+                    "is_gateway_unavailable": True
                 }
-        except httpx.ConnectError:
-            return {
-                "status": "OFFLINE",
-                "message": f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or unreachable.",
-                "is_gateway_unavailable": True
-            }
-        except httpx.TimeoutException:
-            return {
-                "status": "TIMEOUT",
-                "message": f"Connection timed out contacting OpenWA Gateway at {self.base_url}.",
-                "is_gateway_unavailable": True
-            }
-        except Exception as e:
-            logger.error(f"Error checking OpenWA session status: {e}")
-            return {"status": "ERROR", "message": str(e)}
+            except Exception as e:
+                logger.error(f"Error checking OpenWA session status: {e}")
+                return {"status": "ERROR", "message": str(e)}
+
+        return {"status": "ERROR", "message": "Failed to reach OpenWA gateway after retries."}
 
     async def get_session_qr(self) -> Dict[str, Any]:
-        """Retrieve QR code data URL from OpenWA for WhatsApp device linking."""
+        """Retrieve QR code data URL from OpenWA for WhatsApp device linking with auto wake-up retry."""
         sid = await self.resolve_session_uuid()
         url = f"{self.base_url}/api/sessions/{sid}/qr"
-        try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                res = await client.get(url, headers=self.get_auth_headers())
-                if res.status_code == 200:
-                    try:
-                        data = res.json()
-                    except Exception:
-                        data = res.text
-                    qr_val = (
-                        data.get("qrCode") or data.get("qr")
-                        if isinstance(data, dict)
-                        else (data if isinstance(data, str) and "data:image" in data else "")
-                    )
-                    if qr_val:
-                        return {"success": True, "qr": qr_val}
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=25.0) as client:
+                    res = await client.get(url, headers=self.get_auth_headers())
+                    if res.status_code == 200:
+                        try:
+                            data = res.json()
+                        except Exception:
+                            data = res.text
+                        qr_val = (
+                            data.get("qrCode") or data.get("qr")
+                            if isinstance(data, dict)
+                            else (data if isinstance(data, str) and "data:image" in data else "")
+                        )
+                        if qr_val:
+                            return {"success": True, "qr": qr_val}
 
-                # If session is already authenticated, no QR code is needed
-                if res.status_code == 400 and ("already authenticated" in res.text.lower() or "no qr code needed" in res.text.lower()):
+                    # If session is already authenticated, no QR code is needed
+                    if res.status_code == 400 and ("already authenticated" in res.text.lower() or "no qr code needed" in res.text.lower()):
+                        return {
+                            "success": True,
+                            "already_authenticated": True,
+                            "is_connected": True,
+                            "message": "WhatsApp is already connected and authenticated. No QR code needed.",
+                            "qr": None
+                        }
+
+                    # If 502/503/504 on attempt 0, container is waking up on Render
+                    if res.status_code in [502, 503, 504] and attempt == 0:
+                        logger.info("OpenWA gateway waking up from idle on Render, retrying QR fetch in 3s...")
+                        await asyncio.sleep(3.0)
+                        continue
+
+                    # If session is not started yet, automatically boot session and retry fetching QR
+                    if res.status_code in [400, 404]:
+                        start_res = await self.create_or_start_session()
+                        if start_res.get("success") is not False:
+                            # Wait briefly for engine to generate the initial QR code
+                            await asyncio.sleep(2.0)
+                            retry_res = await client.get(url, headers=self.get_auth_headers())
+                            if retry_res.status_code == 200:
+                                try:
+                                    r_data = retry_res.json()
+                                except Exception:
+                                    r_data = retry_res.text
+                                qr_val = (
+                                    r_data.get("qrCode") or r_data.get("qr")
+                                    if isinstance(r_data, dict)
+                                    else (r_data if isinstance(r_data, str) and "data:image" in r_data else "")
+                                )
+                                if qr_val:
+                                    return {"success": True, "qr": qr_val}
+
+                    clean_msg = clean_error_response(res.status_code, res.text)
                     return {
-                        "success": True,
-                        "already_authenticated": True,
-                        "is_connected": True,
-                        "message": "WhatsApp is already connected and authenticated. No QR code needed.",
-                        "qr": None
+                        "success": False,
+                        "statusCode": res.status_code,
+                        "error": clean_msg,
+                        "detail": clean_msg,
+                        "is_gateway_unavailable": res.status_code in [502, 503, 504]
                     }
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                if attempt == 0:
+                    logger.info("OpenWA connection probe timeout, retrying in 3s...")
+                    await asyncio.sleep(3.0)
+                    continue
+                err_msg = f"Timed out waiting for OpenWA Gateway at {self.base_url}. Service may be waking up from Render sleep."
+                return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
+            except Exception as e:
+                logger.error(f"Error fetching OpenWA QR code: {e}")
+                return {"success": False, "error": str(e)}
 
-                # If session is not started yet, automatically boot session and retry fetching QR
-                if res.status_code in [400, 404]:
-                    start_res = await self.create_or_start_session()
-                    if start_res.get("success") is not False:
-                        # Wait briefly for engine to generate the initial QR code
-                        await asyncio.sleep(2.0)
-                        retry_res = await client.get(url, headers=self.get_auth_headers())
-                        if retry_res.status_code == 200:
-                            try:
-                                r_data = retry_res.json()
-                            except Exception:
-                                r_data = retry_res.text
-                            qr_val = (
-                                r_data.get("qrCode") or r_data.get("qr")
-                                if isinstance(r_data, dict)
-                                else (r_data if isinstance(r_data, str) and "data:image" in r_data else "")
-                            )
-                            if qr_val:
-                                return {"success": True, "qr": qr_val}
+        return {"success": False, "error": "Unable to fetch QR code after retries."}
 
-                clean_msg = clean_error_response(res.status_code, res.text)
-                return {
-                    "success": False,
-                    "statusCode": res.status_code,
-                    "error": clean_msg,
-                    "detail": clean_msg,
-                    "is_gateway_unavailable": res.status_code in [502, 503, 504]
-                }
-        except httpx.ConnectError:
-            err_msg = f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or unreachable."
-            return {"success": False, "error": err_msg, "statusCode": 503, "is_gateway_unavailable": True}
-        except httpx.TimeoutException:
-            err_msg = f"Timed out waiting for OpenWA Gateway at {self.base_url}. Service may be booting or sleeping on Render."
-            return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
-        except Exception as e:
-            logger.error(f"Error fetching OpenWA QR code: {e}")
-            return {"success": False, "error": str(e)}
+    async def wake_gateway(self) -> Dict[str, Any]:
+        """Send an active wake-up probe to OpenWA with extended timeout (up to 45s) to wake from Render sleep."""
+        url = f"{self.base_url}/health"
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=40.0) as client:
+                    res = await client.get(url)
+                    if res.status_code in [200, 401, 404]:
+                        return {
+                            "success": True,
+                            "is_awake": True,
+                            "message": f"OpenWA Gateway at {self.base_url} is active and ready."
+                        }
+            except Exception as e:
+                logger.info(f"Wake-up attempt {attempt + 1} notice: {e}")
+                await asyncio.sleep(3.0)
+
+        return {
+            "success": False,
+            "is_awake": False,
+            "message": f"Could not wake OpenWA Gateway at {self.base_url} after multiple attempts."
+        }
 
     async def create_or_start_session(self) -> Dict[str, Any]:
         """Create or initialize WhatsApp session on OpenWA gateway."""

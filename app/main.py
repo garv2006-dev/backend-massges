@@ -4,6 +4,8 @@ Provides the central FastAPI app instance with CORS, lifespan database initializ
 health check endpoints, and standardized routing.
 """
 
+import asyncio
+import httpx
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -15,13 +17,45 @@ from app.routers.main import router
 
 logger = logging.getLogger("app.main")
 
+
+async def openwa_keepalive_worker():
+    """
+    Continuous background keep-alive worker to prevent OpenWA and backend
+    from spinning down / sleeping on Render's 15-minute inactivity limit.
+    Pings every 5 minutes (300s).
+    """
+    # Wait 20 seconds after startup before the first ping
+    await asyncio.sleep(20)
+    while True:
+        try:
+            base_url = (getattr(settings, "OPENWA_BASE_URL", "") or "").strip().rstrip("/")
+            if base_url and not any(h in base_url for h in ["localhost", "127.0.0.1", "host.docker.internal"]):
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    res = await client.get(f"{base_url}/health")
+                    logger.info(f"OpenWA keep-alive ping: {res.status_code} (preventing Render sleep)")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"OpenWA keep-alive probe note: {e}")
+
+        # Sleep for 5 minutes (300s) — safely under Render's 15-minute idle cutoff
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
     # Initialize database tables on startup
     await init_db()
+    # Start the continuous 24/7 keep-alive background worker
+    keepalive_task = asyncio.create_task(openwa_keepalive_worker())
     yield
     # Graceful shutdown
+    keepalive_task.cancel()
+    try:
+        await keepalive_task
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(

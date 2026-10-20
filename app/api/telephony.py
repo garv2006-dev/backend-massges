@@ -174,6 +174,15 @@ async def logout_openwa_session():
     return res
 
 
+@router.post("/openwa/wake")
+async def wake_openwa_gateway():
+    """
+    Actively probe and wake up the OpenWA gateway from Render sleep with an extended timeout.
+    """
+    res = await openwa_provider.wake_gateway()
+    return res
+
+
 @router.post("/openwa/test-call")
 async def test_whatsapp_outbound_call(payload: TestCallRequest):
     """
