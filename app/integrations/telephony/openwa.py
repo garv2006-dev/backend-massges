@@ -42,6 +42,8 @@ def clean_error_response(status_code: int, raw_text: str) -> str:
         if title_match:
             return f"HTTP {status_code}: {title_match.group(1).strip()}"
         return f"HTTP {status_code} Gateway Error (HTML response received)"
+    if status_code == 401:
+        return "OpenWA Authentication Failed (401 Unauthorized). Check that OPENWA_API_KEY in the backend matches the API_KEY configured on the OpenWA Render service."
     if len(text) > 300:
         return text[:300] + "..."
     return text
