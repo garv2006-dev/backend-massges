@@ -164,6 +164,16 @@ async def init_openwa_session():
     return res
 
 
+@router.post("/openwa/logout")
+async def logout_openwa_session():
+    """
+    Disconnect / unlink the active WhatsApp session on OpenWA gateway
+    so a new phone number QR code can be generated and scanned.
+    """
+    res = await openwa_provider.logout_session()
+    return res
+
+
 @router.post("/openwa/test-call")
 async def test_whatsapp_outbound_call(payload: TestCallRequest):
     """

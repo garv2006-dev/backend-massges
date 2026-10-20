@@ -228,6 +228,16 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     if qr_val:
                         return {"success": True, "qr": qr_val}
 
+                # If session is already authenticated, no QR code is needed
+                if res.status_code == 400 and ("already authenticated" in res.text.lower() or "no qr code needed" in res.text.lower()):
+                    return {
+                        "success": True,
+                        "already_authenticated": True,
+                        "is_connected": True,
+                        "message": "WhatsApp is already connected and authenticated. No QR code needed.",
+                        "qr": None
+                    }
+
                 # If session is not started yet, automatically boot session and retry fetching QR
                 if res.status_code in [400, 404]:
                     start_res = await self.create_or_start_session()
@@ -297,6 +307,26 @@ class OpenWATelephonyProvider(TelephonyProvider):
             return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
         except Exception as e:
             logger.error(f"Error starting OpenWA session: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def logout_session(self) -> Dict[str, Any]:
+        """Log out / unlink WhatsApp device from OpenWA to allow pairing a new number."""
+        sid = await self.resolve_session_uuid()
+        url = f"{self.base_url}/api/sessions/{sid}/logout"
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                res = await client.post(url, json={}, headers=self.get_auth_headers())
+                self._resolved_session_id = None
+                if res.status_code in [200, 201, 204, 404]:
+                    return {
+                        "success": True,
+                        "message": "WhatsApp device unlinked successfully. You can now scan a new QR code."
+                    }
+                clean_msg = clean_error_response(res.status_code, res.text)
+                return {"success": False, "error": clean_msg}
+        except Exception as e:
+            logger.error(f"Error logging out OpenWA session: {e}")
+            self._resolved_session_id = None
             return {"success": False, "error": str(e)}
 
     async def ensure_webhook_registered(self) -> Dict[str, Any]:
