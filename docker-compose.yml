@@ -61,6 +61,9 @@ services:
       - "2785:2785"
     environment:
       - PORT=2785
+      - API_PORT=2785
+      - BIND_HOST=0.0.0.0
+      - ENGINE_TYPE=baileys
       - NODE_ENV=production
       - API_KEY=${OPENWA_API_KEY:-}
       - DB_TYPE=sqlite

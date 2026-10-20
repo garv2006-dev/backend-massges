@@ -167,3 +167,39 @@ docker compose restart openwa
 # Gracefully stop the stack
 docker compose down
 ```
+
+---
+
+## ⚠️ Troubleshooting: Render "502 Bad Gateway" on WhatsApp Gateway
+
+If your production backend logs show `502 Bad Gateway` from Render when calling OpenWA or opening the QR code:
+
+### 1. Root Causes:
+1. **Binding to localhost**: OpenWA defaults `BIND_HOST` to `127.0.0.1`. Inside a Docker container on Render, Render's edge router attempts to reach the container and gets connection refused.
+   - **Fix**: Set `BIND_HOST=0.0.0.0`.
+2. **Headless Chromium Crash (Out of Memory)**: The default `whatsapp-web.js` engine launches headless Chromium, which consumes 800MB–1.2GB RAM and crashes on Render Starter or Free tier with exit code 137 (OOM).
+   - **Fix**: Set `ENGINE_TYPE=baileys`. Baileys uses pure WebSockets, requires NO Chromium, uses only ~60MB RAM, boots in 2 seconds, and works reliably on small cloud instances.
+3. **Render Free Tier Sleep / Spun Down**: Render free services spin down after 15 minutes of inactivity. When a request arrives, Render takes 45–60 seconds to wake up the service, returning 502 until the container is ready.
+   - **Fix**: Upgrade to Starter ($7/mo) or wait 45 seconds and click "Retry Starting Session".
+4. **Port Configuration**: OpenWA must have both `PORT=2785` and `API_PORT=2785` matching Render's routed port.
+
+### 2. Required Render Environment Variables for `openwa-gateway`:
+```env
+PORT=2785
+API_PORT=2785
+BIND_HOST=0.0.0.0
+ENGINE_TYPE=baileys
+NODE_ENV=production
+DB_TYPE=sqlite
+DB_SQLITE_PATH=/app/data/openwa.sqlite
+MEDIA_STORAGE=local
+MEDIA_LOCAL_PATH=/app/data/media
+MEDIA_CONVERSION_ENABLED=true
+ENABLE_SWAGGER=true
+WEBHOOK_SSRF_PROTECT=false
+```
+
+### 3. Backend Environment Variable:
+For fastest performance and avoiding public timeouts, set `OPENWA_BASE_URL` on your backend:
+- Over Render Private Network: `http://openwa-gateway:2785`
+- Or your public service URL: `https://<your-openwa-slug>.onrender.com`

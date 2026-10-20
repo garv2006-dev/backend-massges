@@ -25,6 +25,28 @@ logger = logging.getLogger(__name__)
 
 SENTINEL = object()
 
+
+def clean_error_response(status_code: int, raw_text: str) -> str:
+    """Extract clean, human-readable error description from gateway response (handles HTML 502/503/504)."""
+    if not raw_text:
+        return f"HTTP {status_code} Error"
+    text = str(raw_text).strip()
+    if text.startswith("<") or "<html" in text.lower():
+        if status_code == 502:
+            return "OpenWA Gateway is unavailable (502 Bad Gateway). Service on Render is sleeping, restarting, or unreachable."
+        elif status_code == 503:
+            return "OpenWA Gateway is temporarily unavailable (503 Service Unavailable). The service may be starting up."
+        elif status_code == 504:
+            return "OpenWA Gateway request timed out (504 Gateway Timeout)."
+        title_match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE)
+        if title_match:
+            return f"HTTP {status_code}: {title_match.group(1).strip()}"
+        return f"HTTP {status_code} Gateway Error (HTML response received)"
+    if len(text) > 300:
+        return text[:300] + "..."
+    return text
+
+
 class OpenWATelephonyProvider(TelephonyProvider):
     """
     OpenWA WhatsApp Telephony Gateway Integration.
@@ -154,14 +176,31 @@ class OpenWATelephonyProvider(TelephonyProvider):
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get(url, headers=self.get_auth_headers())
                 if res.status_code == 200:
-                    return res.json()
+                    try:
+                        return res.json()
+                    except Exception:
+                        return {"status": "ERROR", "message": "Invalid JSON response from OpenWA"}
                 elif res.status_code == 404:
                     return {"status": "DISCONNECTED", "message": f"Session '{self.session_id}' not found"}
-                return {"status": "ERROR", "statusCode": res.status_code, "body": res.text}
+                clean_msg = clean_error_response(res.status_code, res.text)
+                return {
+                    "status": "ERROR",
+                    "statusCode": res.status_code,
+                    "body": clean_msg,
+                    "message": clean_msg,
+                    "is_gateway_unavailable": res.status_code in [502, 503, 504]
+                }
         except httpx.ConnectError:
             return {
                 "status": "OFFLINE",
-                "message": f"Cannot connect to OpenWA Gateway at {self.base_url}. Ensure OpenWA is running via Docker."
+                "message": f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or unreachable.",
+                "is_gateway_unavailable": True
+            }
+        except httpx.TimeoutException:
+            return {
+                "status": "TIMEOUT",
+                "message": f"Connection timed out contacting OpenWA Gateway at {self.base_url}.",
+                "is_gateway_unavailable": True
             }
         except Exception as e:
             logger.error(f"Error checking OpenWA session status: {e}")
@@ -172,17 +211,55 @@ class OpenWATelephonyProvider(TelephonyProvider):
         sid = await self.resolve_session_uuid()
         url = f"{self.base_url}/api/sessions/{sid}/qr"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=12.0) as client:
                 res = await client.get(url, headers=self.get_auth_headers())
                 if res.status_code == 200:
-                    data = res.json()
-                    # OpenWA returns { qrCode: "data:image/png;base64,..." } or { qr: "..." }
-                    qr_val = data.get("qrCode") or data.get("qr") or (data if isinstance(data, str) else "")
-                    return {"success": True, "qr": qr_val}
-                # If session is not started yet, automatically start it
+                    try:
+                        data = res.json()
+                    except Exception:
+                        data = res.text
+                    qr_val = (
+                        data.get("qrCode") or data.get("qr")
+                        if isinstance(data, dict)
+                        else (data if isinstance(data, str) and "data:image" in data else "")
+                    )
+                    if qr_val:
+                        return {"success": True, "qr": qr_val}
+
+                # If session is not started yet, automatically boot session and retry fetching QR
                 if res.status_code in [400, 404]:
-                    await self.create_or_start_session()
-                return {"success": False, "statusCode": res.status_code, "detail": res.text}
+                    start_res = await self.create_or_start_session()
+                    if start_res.get("success") is not False:
+                        # Wait briefly for engine to generate the initial QR code
+                        await asyncio.sleep(2.0)
+                        retry_res = await client.get(url, headers=self.get_auth_headers())
+                        if retry_res.status_code == 200:
+                            try:
+                                r_data = retry_res.json()
+                            except Exception:
+                                r_data = retry_res.text
+                            qr_val = (
+                                r_data.get("qrCode") or r_data.get("qr")
+                                if isinstance(r_data, dict)
+                                else (r_data if isinstance(r_data, str) and "data:image" in r_data else "")
+                            )
+                            if qr_val:
+                                return {"success": True, "qr": qr_val}
+
+                clean_msg = clean_error_response(res.status_code, res.text)
+                return {
+                    "success": False,
+                    "statusCode": res.status_code,
+                    "error": clean_msg,
+                    "detail": clean_msg,
+                    "is_gateway_unavailable": res.status_code in [502, 503, 504]
+                }
+        except httpx.ConnectError:
+            err_msg = f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or unreachable."
+            return {"success": False, "error": err_msg, "statusCode": 503, "is_gateway_unavailable": True}
+        except httpx.TimeoutException:
+            err_msg = f"Timed out waiting for OpenWA Gateway at {self.base_url}. Service may be booting or sleeping on Render."
+            return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
         except Exception as e:
             logger.error(f"Error fetching OpenWA QR code: {e}")
             return {"success": False, "error": str(e)}
@@ -195,11 +272,27 @@ class OpenWATelephonyProvider(TelephonyProvider):
             async with httpx.AsyncClient(timeout=25.0) as client:
                 res = await client.post(start_url, json={}, headers=self.get_auth_headers())
                 if res.status_code in [200, 201]:
-                    return res.json()
+                    try:
+                        return res.json()
+                    except Exception:
+                        return {"success": True, "status": "started"}
                 # If 404, reset cached id and try again
                 if res.status_code == 404:
                     self._resolved_session_id = None
-                return {"success": False, "statusCode": res.status_code, "detail": res.text}
+                clean_msg = clean_error_response(res.status_code, res.text)
+                return {
+                    "success": False,
+                    "statusCode": res.status_code,
+                    "error": clean_msg,
+                    "detail": clean_msg,
+                    "is_gateway_unavailable": res.status_code in [502, 503, 504]
+                }
+        except httpx.ConnectError:
+            err_msg = f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or unreachable."
+            return {"success": False, "error": err_msg, "statusCode": 503, "is_gateway_unavailable": True}
+        except httpx.TimeoutException:
+            err_msg = f"Timed out connecting to OpenWA Gateway at {self.base_url}. Service may be starting up on Render."
+            return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
         except Exception as e:
             logger.error(f"Error starting OpenWA session: {e}")
             return {"success": False, "error": str(e)}
@@ -218,11 +311,14 @@ class OpenWATelephonyProvider(TelephonyProvider):
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get(list_url, headers=headers)
                 if res.status_code == 200:
-                    existing = res.json()
-                    if isinstance(existing, list):
-                        for hook in existing:
-                            if hook.get("url") == target_url and hook.get("active", True):
-                                return {"success": True, "already_registered": True, "webhook": hook}
+                    try:
+                        existing = res.json()
+                        if isinstance(existing, list):
+                            for hook in existing:
+                                if hook.get("url") == target_url and hook.get("active", True):
+                                    return {"success": True, "already_registered": True, "webhook": hook}
+                    except Exception:
+                        pass
                 # Register webhook
                 create_payload = {
                     "url": target_url,
@@ -232,8 +328,9 @@ class OpenWATelephonyProvider(TelephonyProvider):
                 if c_res.status_code in [200, 201]:
                     logger.info(f"Successfully registered OpenWA webhook to {target_url}")
                     return {"success": True, "registered": True, "webhook": c_res.json()}
-                logger.warning(f"Could not register OpenWA webhook: {c_res.status_code} - {c_res.text}")
-                return {"success": False, "detail": c_res.text}
+                clean_msg = clean_error_response(c_res.status_code, c_res.text)
+                logger.warning(f"Could not register OpenWA webhook: {c_res.status_code} - {clean_msg}")
+                return {"success": False, "detail": clean_msg}
         except Exception as e:
             logger.warning(f"Notice on ensuring OpenWA webhook: {e}")
             return {"success": False, "error": str(e)}
@@ -281,8 +378,9 @@ class OpenWATelephonyProvider(TelephonyProvider):
                 res = await client.post(url, json=payload, headers=self.get_auth_headers())
                 if res.status_code in [200, 201]:
                     return res.json()
-                logger.error(f"OpenWA send-text error: {res.status_code} - {res.text}")
-                return {"success": False, "statusCode": res.status_code, "detail": res.text}
+                clean_msg = clean_error_response(res.status_code, res.text)
+                logger.error(f"OpenWA send-text error: {res.status_code} - {clean_msg}")
+                return {"success": False, "statusCode": res.status_code, "detail": clean_msg, "error": clean_msg}
         except Exception as e:
             logger.error(f"Failed to send text message via OpenWA: {e}")
             return {"success": False, "error": str(e)}
@@ -311,8 +409,9 @@ class OpenWATelephonyProvider(TelephonyProvider):
                 res = await client.post(url, json=payload, headers=self.get_auth_headers())
                 if res.status_code in [200, 201]:
                     return res.json()
-                logger.error(f"OpenWA send-audio error: {res.status_code} - {res.text}")
-                return {"success": False, "statusCode": res.status_code, "detail": res.text}
+                clean_msg = clean_error_response(res.status_code, res.text)
+                logger.error(f"OpenWA send-audio error: {res.status_code} - {clean_msg}")
+                return {"success": False, "statusCode": res.status_code, "detail": clean_msg, "error": clean_msg}
         except Exception as e:
             logger.error(f"Failed to send voice audio via OpenWA: {e}")
             return {"success": False, "error": str(e)}

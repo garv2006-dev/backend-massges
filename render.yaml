@@ -61,6 +61,12 @@ services:
     envVars:
       - key: PORT
         value: "2785"
+      - key: API_PORT
+        value: "2785"
+      - key: BIND_HOST
+        value: "0.0.0.0"
+      - key: ENGINE_TYPE
+        value: baileys
       - key: NODE_ENV
         value: production
       - key: DB_TYPE
