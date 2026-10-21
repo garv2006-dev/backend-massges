@@ -149,7 +149,7 @@ async def start_whatsapp_session():
         if isinstance(res, dict) and res.get("success") is False:
             return {
                 "success": False,
-                "error": res.get("error") or res.get("detail") or "Failed to start WhatsApp session on OpenWA gateway",
+                "error": res.get("error") or res.get("detail") or "WhatsApp service is starting up. Please wait a moment.",
                 "statusCode": res.get("statusCode", 500),
                 "is_gateway_unavailable": res.get("is_gateway_unavailable", False),
                 "data": res

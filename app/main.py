@@ -102,11 +102,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(router, prefix="/api")
 
 @app.get("/health", tags=["System"])
+@app.get("/api/health", tags=["System"])
 async def health_check():
     """Service liveness probe."""
     return {"status": "healthy", "service": settings.PROJECT_NAME, "version": "1.0.0"}
 
 @app.get("/ready", tags=["System"])
+@app.get("/api/ready", tags=["System"])
 async def ready_check():
     """Service readiness probe."""
     return {"status": "ready"}

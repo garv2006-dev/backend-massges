@@ -24,6 +24,7 @@ from app.database import AsyncSessionLocal
 from app.models.whatsapp_conversation import WhatsAppConversation
 from app.models.whatsapp_message import WhatsAppMessage
 from app.models.company_profile import CompanyProfile
+from app.models.campaign import Campaign
 from app.services.ai_voice_engine import AIVoiceEngine
 from app.integrations.telephony.openwa import OpenWATelephonyProvider, get_public_webhook_url
 from app.security.jwt import decode_access_token
@@ -128,6 +129,16 @@ class TestTextMessageRequest(BaseModel):
     message_text: str = Field(..., description="WhatsApp text content to send")
 
 
+async def _is_simulated_connected() -> bool:
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(CompanyProfile).limit(1))
+            profile = result.scalars().first()
+            return bool(profile and profile.simulated_connected)
+    except Exception:
+        return False
+
+
 @router.get("/openwa/status")
 async def get_openwa_gateway_status():
     """
@@ -136,11 +147,15 @@ async def get_openwa_gateway_status():
     """
     session_status = await openwa_provider.get_session_status()
     is_connected = openwa_provider.is_session_connected(session_status)
+    is_simulated = await _is_simulated_connected()
+    if is_simulated:
+        is_connected = True
 
     return {
         "gateway_url": openwa_provider.base_url,
         "session_id": openwa_provider.session_id,
         "is_connected": is_connected,
+        "simulated": is_simulated,
         "session_details": session_status,
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -151,6 +166,15 @@ async def get_openwa_qr_code():
     """
     Retrieve current WhatsApp QR code from OpenWA for phone pairing.
     """
+    if await _is_simulated_connected():
+        return {
+            "success": True,
+            "already_authenticated": True,
+            "is_connected": True,
+            "message": "WhatsApp is connected in test mode. No QR code needed.",
+            "qr": None
+        }
+
     # If session is already connected/paired, return authenticated state immediately
     if openwa_provider.is_session_connected(openwa_provider._status_cache):
         return {
@@ -198,6 +222,16 @@ async def logout_openwa_session():
     Disconnect / unlink the active WhatsApp session on OpenWA gateway
     so a new phone number QR code can be generated and scanned.
     """
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(CompanyProfile).limit(1))
+            profile = result.scalars().first()
+            if profile and profile.simulated_connected:
+                profile.simulated_connected = False
+                await session.commit()
+    except Exception:
+        pass
+
     res = await openwa_provider.logout_session()
     return res
 
@@ -260,6 +294,16 @@ async def send_whatsapp_test_text(payload: TestTextMessageRequest):
         }
     except Exception as e:
         logger.error(f"Failed to send test WhatsApp text message: {e}")
+        if await _is_simulated_connected():
+            return {
+                "success": True,
+                "chat_id": chat_id,
+                "phone_number": clean_phone,
+                "message": msg_text,
+                "openwa_result": {"status": "simulated_delivered", "simulated": True},
+                "timestamp": datetime.utcnow().isoformat(),
+                "simulated": True
+            }
         return {
             "success": False,
             "error": str(e),
@@ -521,6 +565,32 @@ async def handle_openwa_webhook(request: Request):
                         "text": m.message_text
                     })
 
+                # Look up associated broadcast campaign for this conversation
+                conv_campaign = None
+                camp_id_stmt = (
+                    select(WhatsAppMessage.campaign_id)
+                    .where(
+                        WhatsAppMessage.conversation_id == conv.id,
+                        WhatsAppMessage.campaign_id.isnot(None)
+                    )
+                    .order_by(WhatsAppMessage.created_at.desc())
+                    .limit(1)
+                )
+                camp_id_res = await db.execute(camp_id_stmt)
+                found_campaign_id = camp_id_res.scalar_one_or_none()
+                if found_campaign_id:
+                    conv_campaign = await db.get(Campaign, found_campaign_id)
+
+                if not conv_campaign and conv.user_id:
+                    latest_camp_stmt = (
+                        select(Campaign)
+                        .where(Campaign.created_by == conv.user_id)
+                        .order_by(desc(Campaign.created_at))
+                        .limit(1)
+                    )
+                    latest_res = await db.execute(latest_camp_stmt)
+                    conv_campaign = latest_res.scalar_one_or_none()
+
                 provider_config = {
                     "company_name": "Our Company",
                     "agent_name": "Sarah",
@@ -536,11 +606,26 @@ async def handle_openwa_webhook(request: Request):
                         "industry": company_profile.industry or "Customer Support & Services"
                     }
 
-                # Generate natural, human-like AI reply with resilient fallback
+                if conv_campaign:
+                    camp_cfg = conv_campaign.provider_config or {}
+                    if camp_cfg.get("company_name"):
+                        provider_config["company_name"] = camp_cfg.get("company_name")
+                    if camp_cfg.get("agent_name"):
+                        provider_config["agent_name"] = camp_cfg.get("agent_name")
+                    if camp_cfg.get("language"):
+                        provider_config["language"] = camp_cfg.get("language")
+
+                prompt_instructions = (
+                    conv_campaign.agent_prompt
+                    if (conv_campaign and conv_campaign.agent_prompt)
+                    else f"Assist the customer regarding {provider_config.get('company_name', 'our company')}."
+                )
+
+                # Generate natural, human-like AI reply with resilient fallback in the selected language
                 try:
                     agent_reply = await AIVoiceEngine.generate_live_turn(
-                        campaign_name="WhatsApp Assistant",
-                        agent_prompt=f"Assist the customer regarding {provider_config.get('company_name', 'our company')}.",
+                        campaign_name=conv_campaign.name if conv_campaign else "WhatsApp Assistant",
+                        agent_prompt=prompt_instructions,
                         provider_config=provider_config,
                         conversation_history=dialogue_history,
                         user_message=user_text,
@@ -554,6 +639,7 @@ async def handle_openwa_webhook(request: Request):
                 # Save outbound AI response
                 ai_msg = WhatsAppMessage(
                     conversation_id=conv.id,
+                    campaign_id=conv_campaign.id if conv_campaign else None,
                     sender="agent",
                     direction="outbound",
                     message_text=agent_reply,
@@ -623,6 +709,7 @@ async def handle_openwa_webhook(request: Request):
 class ConversationReplyRequest(BaseModel):
     message: str
     contact_name: Optional[str] = "Customer"
+    campaign_id: Optional[str] = None
     send_live_openwa: Optional[bool] = True
 
 
@@ -829,6 +916,39 @@ async def post_conversation_customer_reply(phone_number: str, payload: Conversat
                     "text": m.message_text
                 })
 
+            # Look up associated broadcast campaign for this conversation
+            conv_campaign = None
+            if payload.campaign_id:
+                try:
+                    conv_campaign = await db.get(Campaign, uuid.UUID(payload.campaign_id))
+                except Exception:
+                    pass
+
+            if not conv_campaign:
+                camp_id_stmt = (
+                    select(WhatsAppMessage.campaign_id)
+                    .where(
+                        WhatsAppMessage.conversation_id == conv.id,
+                        WhatsAppMessage.campaign_id.isnot(None)
+                    )
+                    .order_by(WhatsAppMessage.created_at.desc())
+                    .limit(1)
+                )
+                camp_id_res = await db.execute(camp_id_stmt)
+                found_campaign_id = camp_id_res.scalar_one_or_none()
+                if found_campaign_id:
+                    conv_campaign = await db.get(Campaign, found_campaign_id)
+
+            if not conv_campaign and conv.user_id:
+                latest_camp_stmt = (
+                    select(Campaign)
+                    .where(Campaign.created_by == conv.user_id)
+                    .order_by(desc(Campaign.created_at))
+                    .limit(1)
+                )
+                latest_res = await db.execute(latest_camp_stmt)
+                conv_campaign = latest_res.scalar_one_or_none()
+
             provider_config = {
                 "company_name": "Our Company",
                 "agent_name": "Sarah",
@@ -844,11 +964,26 @@ async def post_conversation_customer_reply(phone_number: str, payload: Conversat
                     "industry": company_profile.industry or "Customer Support & Services"
                 }
 
-            # Resilient AI generation with polite human fallback
+            if conv_campaign:
+                camp_cfg = conv_campaign.provider_config or {}
+                if camp_cfg.get("company_name"):
+                    provider_config["company_name"] = camp_cfg.get("company_name")
+                if camp_cfg.get("agent_name"):
+                    provider_config["agent_name"] = camp_cfg.get("agent_name")
+                if camp_cfg.get("language"):
+                    provider_config["language"] = camp_cfg.get("language")
+
+            prompt_instructions = (
+                conv_campaign.agent_prompt
+                if (conv_campaign and conv_campaign.agent_prompt)
+                else f"Assist the customer regarding {provider_config.get('company_name', 'our company')}."
+            )
+
+            # Resilient AI generation with polite human fallback in selected language
             try:
                 agent_reply = await AIVoiceEngine.generate_live_turn(
-                    campaign_name="WhatsApp Assistant",
-                    agent_prompt=f"Assist the customer regarding {provider_config.get('company_name', 'our company')}.",
+                    campaign_name=conv_campaign.name if conv_campaign else "WhatsApp Assistant",
+                    agent_prompt=prompt_instructions,
                     provider_config=provider_config,
                     conversation_history=dialogue_history,
                     user_message=user_text,
@@ -861,6 +996,7 @@ async def post_conversation_customer_reply(phone_number: str, payload: Conversat
 
             ai_msg = WhatsAppMessage(
                 conversation_id=conv.id,
+                campaign_id=conv_campaign.id if conv_campaign else None,
                 sender="agent",
                 direction="outbound",
                 message_text=agent_reply,

@@ -17,7 +17,7 @@ import time
 import json
 from typing import Dict, Any, Optional, List
 import httpx
-import edge_tts
+import edge_tts  # type: ignore
 
 from app.integrations.telephony.base import TelephonyProvider
 from app.config import settings
@@ -34,15 +34,13 @@ def clean_error_response(status_code: int, raw_text: str) -> str:
         return f"Gateway response error ({status_code})"
     text = str(raw_text).strip()
 
-    # 1. HTML errors from Render router (502/503/504)
+    # 1. HTML errors from gateway router (502/503/504)
     if text.startswith("<") or "<html" in text.lower():
-        if status_code == 502:
-            return "WhatsApp Gateway is waking up from Render sleep (~30s). Please wait a moment."
-        elif status_code == 503:
-            return "WhatsApp Gateway is temporarily starting up. Please wait."
+        if status_code in [502, 503]:
+            return "WhatsApp service is starting up. Please wait a moment."
         elif status_code == 504:
-            return "WhatsApp Gateway connection timed out. Please retry shortly."
-        return "WhatsApp Gateway is starting up."
+            return "WhatsApp service is taking a moment to respond. Please wait shortly."
+        return "WhatsApp service is starting up. Please wait."
 
     # 2. Rate limit / Throttling (429)
     if status_code == 429 or "throttler" in text.lower() or "too many requests" in text.lower():
@@ -133,31 +131,41 @@ class OpenWATelephonyProvider(TelephonyProvider):
     def supports_india_domestic(self) -> bool:
         return True
 
+    @property
+    def effective_base_url(self) -> str:
+        return (os.getenv("OPENWA_BASE_URL") or getattr(settings, "OPENWA_BASE_URL", None) or self.base_url).strip().rstrip("/")
+
+    @property
+    def effective_session_id(self) -> str:
+        return (os.getenv("OPENWA_SESSION_ID") or getattr(settings, "OPENWA_SESSION_ID", None) or self.session_id).strip()
+
     def get_auth_headers(self) -> Dict[str, str]:
         """Headers required by OpenWA API."""
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        if self.api_key:
-            headers["X-API-Key"] = str(self.api_key).strip()
+        api_key = os.getenv("OPENWA_API_KEY") or getattr(settings, "OPENWA_API_KEY", None) or self.api_key
+        if api_key:
+            headers["X-API-Key"] = str(api_key).strip()
         return headers
 
     async def resolve_session_uuid(self) -> str:
         """
         OpenWA v0.25+ identifies sessions by UUID (e.g. 04defc4a-...).
-        This helper resolves self.session_id (which might be 'default')
+        This helper resolves self.effective_session_id (which might be 'default')
         to the matching active session UUID, or automatically creates it.
         """
+        current_target = self.effective_session_id
         if self._resolved_session_id:
             return self._resolved_session_id
 
         # If already formatted as a standard 36-char UUID, use directly
-        if len(self.session_id) == 36 and self.session_id.count("-") == 4:
-            self._resolved_session_id = self.session_id
-            return self.session_id
+        if len(current_target) == 36 and current_target.count("-") == 4:
+            self._resolved_session_id = current_target
+            return current_target
 
-        url = f"{self.base_url}/api/sessions"
+        url = f"{self.effective_base_url}/api/sessions"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 res = await client.get(url, headers=self.get_auth_headers())
@@ -165,21 +173,25 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     sessions = res.json()
                     if isinstance(sessions, list):
                         for s in sessions:
-                            if s.get("name") == self.session_id or s.get("id") == self.session_id:
-                                self._resolved_session_id = s.get("id")
-                                return self._resolved_session_id
+                            if isinstance(s, dict) and (s.get("name") == current_target or s.get("id") == current_target):
+                                sid = s.get("id")
+                                if sid:
+                                    self._resolved_session_id = str(sid)
+                                    return self._resolved_session_id
 
-                # If session does not exist yet, create it with payload {"name": self.session_id}
-                create_res = await client.post(url, json={"name": self.session_id}, headers=self.get_auth_headers())
+                # If session does not exist yet, create it with payload {"name": current_target}
+                create_res = await client.post(url, json={"name": current_target}, headers=self.get_auth_headers())
                 if create_res.status_code in [200, 201]:
                     new_session = create_res.json()
-                    if new_session.get("id"):
-                        self._resolved_session_id = new_session.get("id")
-                        return self._resolved_session_id
+                    if isinstance(new_session, dict):
+                        sid = new_session.get("id")
+                        if sid:
+                            self._resolved_session_id = str(sid)
+                            return self._resolved_session_id
         except Exception as e:
             logger.debug(f"OpenWA resolve_session_uuid notice: {e}")
 
-        return self.session_id
+        return str(current_target)
 
     def normalize_phone_to_jid(self, phone: str) -> str:
         """
@@ -286,7 +298,7 @@ class OpenWATelephonyProvider(TelephonyProvider):
                         "message": clean_msg,
                         "is_gateway_unavailable": res.status_code in [502, 503, 504]
                     }
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
+            except (httpx.ConnectError, httpx.TimeoutException):
                 if attempt == 0:
                     logger.info("Timeout/connection probe on OpenWA, retrying in 3s...")
                     await asyncio.sleep(3.0)
@@ -294,7 +306,7 @@ class OpenWATelephonyProvider(TelephonyProvider):
                 return {
                     "status": "OFFLINE",
                     "is_connected": False,
-                    "message": "WhatsApp Gateway is offline or waking up from Render sleep. Please try again shortly.",
+                    "message": "WhatsApp service is starting up. Please wait a moment.",
                     "is_gateway_unavailable": True
                 }
             except Exception as e:
@@ -363,9 +375,17 @@ class OpenWATelephonyProvider(TelephonyProvider):
                         await asyncio.sleep(3.0)
                         continue
 
+                    # If QR code is currently generating or rotating, wait briefly and retry
+                    if res.status_code == 400 and ("not ready" in res.text.lower() or "please wait" in res.text.lower()) and attempt == 0:
+                        logger.info("OpenWA QR code is regenerating, retrying in 2.5s...")
+                        await asyncio.sleep(2.5)
+                        continue
+
                     # If session is not started yet, automatically boot session and retry fetching QR
                     if res.status_code in [400, 404]:
                         start_res = await self.create_or_start_session()
+                        if start_res.get("success") is False and start_res.get("is_gateway_unavailable"):
+                            return start_res
                         if start_res.get("success") is not False:
                             await asyncio.sleep(2.0)
                             retry_res = await client.get(url, headers=self.get_auth_headers())
@@ -390,18 +410,18 @@ class OpenWATelephonyProvider(TelephonyProvider):
                         "detail": clean_msg,
                         "is_gateway_unavailable": res.status_code in [502, 503, 504]
                     }
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
+            except (httpx.ConnectError, httpx.TimeoutException):
                 if attempt == 0:
                     logger.info("OpenWA connection probe timeout, retrying in 3s...")
                     await asyncio.sleep(3.0)
                     continue
-                err_msg = "WhatsApp Gateway is offline or waking up from Render sleep. Please try again shortly."
+                err_msg = "WhatsApp service is starting up. Please wait a moment."
                 return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
             except Exception as e:
                 logger.error(f"Error fetching OpenWA QR code: {e}")
                 return {"success": False, "error": str(e)}
 
-        return {"success": False, "error": "Unable to fetch QR code after retries."}
+        return {"success": False, "error": "WhatsApp service is preparing. Please wait a moment."}
 
     async def wake_gateway(self) -> Dict[str, Any]:
         """Send an active wake-up probe to OpenWA with extended timeout (up to 45s) to wake from Render sleep."""
@@ -438,6 +458,9 @@ class OpenWATelephonyProvider(TelephonyProvider):
                         return res.json()
                     except Exception:
                         return {"success": True, "status": "started"}
+                # If session is already started, it is successfully running
+                if res.status_code == 400 and "already started" in res.text.lower():
+                    return {"success": True, "status": "already_started", "message": "Session is active and ready"}
                 # If 404, reset cached id and try again
                 if res.status_code == 404:
                     self._resolved_session_id = None
@@ -450,10 +473,10 @@ class OpenWATelephonyProvider(TelephonyProvider):
                     "is_gateway_unavailable": res.status_code in [502, 503, 504]
                 }
         except httpx.ConnectError:
-            err_msg = f"Cannot connect to OpenWA Gateway at {self.base_url}. Service is offline or unreachable."
+            err_msg = "WhatsApp connection service is temporarily offline. Please wait a moment."
             return {"success": False, "error": err_msg, "statusCode": 503, "is_gateway_unavailable": True}
         except httpx.TimeoutException:
-            err_msg = f"Timed out connecting to OpenWA Gateway at {self.base_url}. Service may be starting up on Render."
+            err_msg = "WhatsApp connection service is starting up. Please wait a moment."
             return {"success": False, "error": err_msg, "statusCode": 504, "is_gateway_unavailable": True}
         except Exception as e:
             logger.error(f"Error starting OpenWA session: {e}")
@@ -646,11 +669,12 @@ class OpenWATelephonyProvider(TelephonyProvider):
     async def create_call(
         self,
         phone_number: str,
-        caller_id: Optional[str] = None,
+        caller_id: str = "",
+        webhook_url: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
         speech_text: Optional[str] = None,
         voice: str = "en-IN-NeerjaNeural",
-        webhook_url: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        **kwargs: Any
     ) -> Dict[str, Any]:
         """
         Initiate an outbound WhatsApp voice call / interactive voice message to customer.
@@ -659,11 +683,19 @@ class OpenWATelephonyProvider(TelephonyProvider):
         chat_id = self.normalize_phone_to_jid(phone_number)
         logger.info(f"Initiating OpenWA WhatsApp Voice Call to {chat_id} (Phone: {phone_number})")
 
-        prompt_text = speech_text or "Hello! This is your AI assistant calling from our company. How may I assist you today?"
+        prompt_text = speech_text
+        if not prompt_text and metadata and isinstance(metadata, dict):
+            prompt_text = metadata.get("speech_text")
+        if not prompt_text:
+            prompt_text = "Hello! This is your AI assistant calling from our company. How may I assist you today?"
+
+        prompt_voice = voice
+        if metadata and isinstance(metadata, dict) and metadata.get("voice"):
+            prompt_voice = str(metadata.get("voice"))
 
         voice_result = {}
         # Step 1: Synthesize AI Voice
-        audio_bytes = await self.synthesize_speech_bytes(prompt_text, voice=voice)
+        audio_bytes = await self.synthesize_speech_bytes(prompt_text, voice=prompt_voice)
 
         if audio_bytes:
             # Step 2: Send WhatsApp Voice Note (PTT)
